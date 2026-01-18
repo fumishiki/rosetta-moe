@@ -1,7 +1,7 @@
 # cuda-nn
 
-[![CI](https://github.com/pikafumi/machine_learning/actions/workflows/ci.yml/badge.svg)](https://github.com/pikafumi/machine_learning/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/fumi-engineer/machine_learning/actions/workflows/ci.yml/badge.svg)](https://github.com/fumi-engineer/machine_learning/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange)
 ![Go](https://img.shields.io/badge/Go-1.22-blue)
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
@@ -54,35 +54,40 @@
 
 ```
 machine_learning/
-├── crates/
-│   ├── cuda/         # Shared CUDA kernels (9 files)
-│   ├── rust/         # Rust implementation
-│   │   ├── nn-core/  # Model, tensor ops, training
-│   │   └── nn-ffi/   # FFI bridge + GpuTrainer
-│   ├── go/           # Go implementation
-│   │   ├── tensor/   # Tensor operations
-│   │   ├── cuda/     # cgo CUDA bindings
-│   │   ├── layer/    # Neural network layers
-│   │   ├── model/    # MoE Transformer model
-│   │   └── train/    # Training pipeline
-│   └── python/       # Python implementation
-│       ├── nn/       # Neural network module
-│       ├── cuda/     # ctypes CUDA bindings
-│       └── tests/    # pytest tests
-├── docs/             # Design documents
+├── rust/             # Rust implementation
+│   ├── nn-core/      # Model, tensor ops, training
+│   ├── nn-cuda/      # CUDA FFI bindings
+│   └── nn-ffi/       # FFI bridge + GpuTrainer
+├── go/               # Go implementation
+│   ├── tensor/       # Tensor operations
+│   ├── cuda/         # cgo CUDA bindings
+│   ├── layer/        # Neural network layers
+│   ├── model/        # MoE Transformer model
+│   └── train/        # Training pipeline
+├── python/           # Python implementation
+│   ├── nn/           # Neural network module
+│   ├── cuda/         # ctypes CUDA bindings
+│   └── tests/        # pytest tests
+├── cuda/             # Shared CUDA kernels (.cu, stub.c)
+├── benchmarks/       # Cross-language benchmarks
+│   ├── rust/         # Criterion benchmarks
+│   ├── go/           # testing.B benchmarks
+│   └── python/       # timeit + NumPy benchmarks
+├── docs-jp/          # 日本語ドキュメント
+├── docs-en/          # English documentation
 └── Cargo.toml        # Rust workspace
 ```
 
 ## Language Implementations
 
-### Rust (crates/rust/)
+### Rust (rust/)
 
 Pure Rust implementation with `#![forbid(unsafe_code)]` in nn-core.
 
 - **nn-core**: Tensor ops, layers, attention, MoE, training
 - **nn-ffi**: FFI bridge, GpuTensor, GpuTrainer, CUDA Graph
 
-### Go (crates/go/)
+### Go (go/)
 
 Go implementation with cgo bindings to shared CUDA kernels.
 
@@ -91,7 +96,7 @@ Go implementation with cgo bindings to shared CUDA kernels.
 - **model**: MQAttention, Router, MoELayer, TransformerBlock, MoETransformer
 - **train**: AdamW optimizer, LR scheduler, training loop
 
-### Python (crates/python/)
+### Python (python/)
 
 Python implementation with numpy backend and ctypes CUDA bindings.
 
@@ -101,7 +106,7 @@ Python implementation with numpy backend and ctypes CUDA bindings.
 - **nn.train**: AdamW optimizer, LR scheduler, training loop
 - **cuda**: ctypes bindings with CPU fallback
 
-### CUDA Kernels (crates/cuda/)
+### CUDA Kernels (cuda/)
 
 Shared CUDA kernels used by both Rust and Go.
 
@@ -137,7 +142,7 @@ cargo clippy --all-targets
 ### Go
 
 ```bash
-cd crates/go
+cd go
 
 # Test
 go test ./...
@@ -149,7 +154,7 @@ go build ./...
 ### Python
 
 ```bash
-cd crates/python
+cd python
 
 # Install
 pip install -e ".[dev]"
@@ -224,6 +229,60 @@ logits = model.forward_ids(token_ids, batch=1, seq_len=4)
 | GPU decode | ✅ | ✅ | ✅ |
 | GpuTrainer | ✅ | - | - |
 
+## Benchmarks
+
+Cross-language performance comparison using naive implementations (no BLAS/SIMD optimization).
+
+### Results (Apple M-series, single thread)
+
+#### Matrix Multiplication (512×512)
+| Language | Time | Relative |
+|----------|------|----------|
+| Python (NumPy/BLAS) | 215 µs | 1x |
+| Rust (naive) | 125 ms | 581x |
+| Go (naive) | 150 ms | 698x |
+
+#### Softmax (512×32000)
+| Language | Time | Relative |
+|----------|------|----------|
+| Rust | 35.1 ms | 1x |
+| Python (NumPy) | 37.0 ms | 1.05x |
+| Go | 160 ms | 4.6x |
+
+#### SiLU (65536 elements)
+| Language | Time | Relative |
+|----------|------|----------|
+| Rust | 126 µs | 1x |
+| Python (NumPy) | 138 µs | 1.09x |
+| Go | 462 µs | 3.7x |
+
+#### RMSNorm (512×768)
+| Language | Time | Relative |
+|----------|------|----------|
+| Python (NumPy) | 226 µs | 1x |
+| Rust | 441 µs | 1.95x |
+| Go | 751 µs | 3.3x |
+
+### Key Insights
+
+| Factor | Impact |
+|--------|--------|
+| Language overhead (Rust vs Go) | ~2-5x |
+| BLAS vs naive | ~500x |
+| SIMD vectorization | ~4-8x |
+| Cache blocking | ~10-100x |
+
+**Conclusion**: Algorithm and library choice (BLAS, SIMD) dominate performance. Language selection matters less than optimization strategy. In production, all three languages achieve similar performance when using optimized backends (NumPy/BLAS, ndarray/BLAS, gonum/BLAS).
+
+```bash
+# Run benchmarks
+cd benchmarks
+./run_all.sh              # All languages
+./run_all.sh --rust-only  # Rust only
+./run_all.sh --go-only    # Go only
+./run_all.sh --python-only # Python only
+```
+
 ## Design Principles
 
 - **Type safety**: `#![forbid(unsafe_code)]` in Rust nn-core
@@ -236,10 +295,21 @@ logits = model.forward_ids(token_ids, batch=1, seq_len=4)
 
 ## Docs
 
-- [docs/00-index.md](docs/00-index.md) - Documentation index
-- [docs/1-model.md](docs/1-model.md) - Model architecture
-- [docs/2-learn.md](docs/2-learn.md) - Training system
+**日本語 / Japanese**
+- [docs-jp/00-index.md](docs-jp/00-index.md) - ドキュメント索引
+- [docs-jp/1-model.md](docs-jp/1-model.md) - モデルアーキテクチャ
+- [docs-jp/2-learn.md](docs-jp/2-learn.md) - 学習システム
+
+**English**
+- [docs-en/00-index.md](docs-en/00-index.md) - Documentation index
+- [docs-en/1-model.md](docs-en/1-model.md) - Model architecture
+- [docs-en/2-learn.md](docs-en/2-learn.md) - Training system
 
 ## License
 
-[MIT](LICENSE)
+Licensed under either of:
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.

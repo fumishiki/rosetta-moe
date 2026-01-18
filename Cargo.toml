@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cuda",
-    "crates/rust/nn-core",
-    "crates/rust/nn-ffi",
+    "rust/nn-core",
+    "rust/nn-ffi",
 ]
+exclude = ["benchmarks/rust"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [profile.release]
 lto = true

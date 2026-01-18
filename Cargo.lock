@@ -117,17 +117,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nn-cuda"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "nn-ffi"
 version = "0.1.0"
 dependencies = [
- "nn-cuda",
+ "cc",
 ]
 
 [[package]]
