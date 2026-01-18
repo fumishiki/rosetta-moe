@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cuda",
+    "crates/rust/nn-core",
+    "crates/rust/nn-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
