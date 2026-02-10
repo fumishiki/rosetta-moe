@@ -24,13 +24,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use nn_core::{
-    Config, DType, Layer, MoETransformer, RMSNorm, Shape, Tensor, TrainConfig, Trainer,
-};
+use nn_core::{Config, DType, Layer, MoETransformer, RMSNorm, Shape, Tensor, TrainConfig, Trainer};
 
 thread_local! {
     static TL_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -69,9 +67,7 @@ fn make_token_ids(batch: usize, seq_len: usize, vocab: usize) -> Vec<usize> {
 }
 
 fn make_input_tensor(batch: usize, seq_len: usize, vocab: usize) -> Tensor {
-    let data: Vec<f32> = (0..batch * seq_len)
-        .map(|i| (i % vocab) as f32)
-        .collect();
+    let data: Vec<f32> = (0..batch * seq_len).map(|i| (i % vocab) as f32).collect();
     Tensor::from_slice(&data, Shape::new(&[batch, seq_len]))
 }
 
@@ -117,7 +113,7 @@ fn get_peak_rss_bytes() -> u64 {
     let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
     if ret == 0 {
         if cfg!(target_os = "macos") {
-            usage.ru_maxrss as u64       // macOS: already in bytes
+            usage.ru_maxrss as u64 // macOS: already in bytes
         } else {
             usage.ru_maxrss as u64 * 1024 // Linux: in kilobytes
         }
@@ -216,9 +212,7 @@ fn get_cpu_model() -> String {
 }
 
 fn get_os_info() -> String {
-    let output = std::process::Command::new("uname")
-        .args(["-srm"])
-        .output();
+    let output = std::process::Command::new("uname").args(["-srm"]).output();
     match output {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -330,10 +324,7 @@ fn scenario_json(
     };
 
     let alloc_rate = if median_ns > 0 {
-        format!(
-            "{:.2}",
-            m.alloc_bytes as f64 / (median_ns as f64 * 1e-9)
-        )
+        format!("{:.2}", m.alloc_bytes as f64 / (median_ns as f64 * 1e-9))
     } else {
         "0.0".to_string()
     };
@@ -428,9 +419,7 @@ fn bench_mem_train_step() -> String {
         let _ = trainer.train_step(&input, &targets);
     });
 
-    let params = format!(
-        "{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}"
-    );
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}");
     scenario_json(
         "mem_train_step",
         "memory",
@@ -466,9 +455,7 @@ fn bench_mem_scale_batch() -> Vec<String> {
             None => (0, 0, 0.0),
         };
 
-        let params = format!(
-            "{{\"batch\":{b},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}"
-        );
+        let params = format!("{{\"batch\":{b},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}");
         results.push(scenario_json(
             &format!("mem_scale_batch_{b}"),
             "memory",
@@ -506,9 +493,7 @@ fn bench_mem_scale_seq() -> Vec<String> {
             None => (0, 0, 0.0),
         };
 
-        let params = format!(
-            "{{\"batch\":{batch},\"seq_len\":{s},\"hidden_dim\":{HIDDEN}}}"
-        );
+        let params = format!("{{\"batch\":{batch},\"seq_len\":{s},\"hidden_dim\":{HIDDEN}}}");
         results.push(scenario_json(
             &format!("mem_scale_seq_{s}"),
             "memory",
@@ -551,9 +536,7 @@ fn bench_kernel_matmul() -> String {
     let (nan, inf, ma) = check_numerical(&out_tensor);
 
     // known_flops = 2 * M * N * K = 2 * 64 * 64 * 64 = 524288
-    let params = format!(
-        "{{\"M\":{m_dim},\"K\":{k_dim},\"N\":{n_dim}}}"
-    );
+    let params = format!("{{\"M\":{m_dim},\"K\":{k_dim},\"N\":{n_dim}}}");
     scenario_json(
         "kernel_matmul",
         "compiler",
@@ -615,10 +598,7 @@ fn bench_kernel_rmsnorm() -> String {
     };
 
     // known_flops = batch * seq * hidden * 3 = 2 * 32 * 64 * 3 = 12288
-    let params = format!(
-        "{{\"shape\":[{},{},{}]}}",
-        shape[0], shape[1], shape[2]
-    );
+    let params = format!("{{\"shape\":[{},{},{}]}}", shape[0], shape[1], shape[2]);
     scenario_json(
         "kernel_rmsnorm",
         "compiler",
@@ -653,9 +633,7 @@ fn bench_dispatch_warm() -> String {
         None => (0, 0, 0.0),
     };
 
-    let params = format!(
-        "{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}"
-    );
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}");
     scenario_json(
         "dispatch_warm",
         "type_system",
@@ -690,9 +668,7 @@ fn bench_dispatch_cold() -> String {
         None => (0, 0, 0.0),
     };
 
-    let params = format!(
-        "{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}"
-    );
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{HIDDEN}}}");
     scenario_json(
         "dispatch_cold",
         "type_system",
@@ -729,12 +705,13 @@ fn bench_parallel() -> Vec<String> {
         // Wrapped in Mutex because MoETransformer contains RefCell (for MoE route
         // caching), which makes it !Sync. Each thread locks its own Mutex so
         // there is zero contention -- the Mutex is only for Send/Sync compliance.
-        let models: Vec<Mutex<MoETransformer>> =
-            (0..t).map(|_| {
+        let models: Vec<Mutex<MoETransformer>> = (0..t)
+            .map(|_| {
                 let mut m = MoETransformer::tiny();
                 m.set_inference_mode(true);
                 Mutex::new(m)
-            }).collect();
+            })
+            .collect();
 
         // Per-thread alloc accumulators (written by workers, read by main)
         let thread_allocs: Vec<AtomicU64> = (0..t).map(|_| AtomicU64::new(0)).collect();
@@ -964,9 +941,7 @@ fn bench_scale_forward_256() -> String {
         None => (0, 0, 0.0),
     };
 
-    let params = format!(
-        "{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":256}}"
-    );
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":256}}");
     scenario_json(
         "scale_forward_256",
         "scale",
@@ -1004,9 +979,7 @@ fn bench_scale_train_256() -> String {
         let _ = trainer.train_step(&input, &targets);
     });
 
-    let params = format!(
-        "{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":256}}"
-    );
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":256}}");
     scenario_json(
         "scale_train_256",
         "scale",
@@ -1027,7 +1000,10 @@ fn main() {
     eprintln!("Rust MoE Transformer Benchmark (5-axis, 22 scenarios)");
     eprintln!("=====================================================");
 
-    let rust_version = match std::process::Command::new("rustc").arg("--version").output() {
+    let rust_version = match std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Err(_) => "unknown".into(),
     };
@@ -1061,10 +1037,7 @@ fn main() {
     scenario_jsons.push(bench_scale_forward_256());
     scenario_jsons.push(bench_scale_train_256());
 
-    eprintln!(
-        "  done. {} scenarios collected.",
-        scenario_jsons.len()
-    );
+    eprintln!("  done. {} scenarios collected.", scenario_jsons.len());
 
     let json = format!(
         concat!(

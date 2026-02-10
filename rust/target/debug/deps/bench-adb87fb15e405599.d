@@ -1,6 +1,6 @@
-/Users/pikafumi/Desktop/GitHub/machine_learning/rust/target/debug/deps/bench-adb87fb15e405599.d: benches/bench.rs Cargo.toml
+/Users/pikafumi/Desktop/GitHub/rosetta-moe/rust/target/debug/deps/bench-adb87fb15e405599.d: benches/bench.rs Cargo.toml
 
-/Users/pikafumi/Desktop/GitHub/machine_learning/rust/target/debug/deps/libbench-adb87fb15e405599.rmeta: benches/bench.rs Cargo.toml
+/Users/pikafumi/Desktop/GitHub/rosetta-moe/rust/target/debug/deps/libbench-adb87fb15e405599.rmeta: benches/bench.rs Cargo.toml
 
 benches/bench.rs:
 Cargo.toml:

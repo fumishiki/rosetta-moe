@@ -286,7 +286,9 @@ impl Layer for RMSNorm {
 
     impl_single_weight_params!(weight);
 
-    fn set_inference_mode(&mut self, mode: bool) { self.inference_mode = mode; }
+    fn set_inference_mode(&mut self, mode: bool) {
+        self.inference_mode = mode;
+    }
 }
 
 /// Fully connected linear layer (no bias).
@@ -313,7 +315,8 @@ impl Linear {
         // He init: std = sqrt(2/fan_in)
         let std = (2.0 / in_features as f32).sqrt();
         Self {
-            weight: Tensor::randn(Shape::new(&[out_features, in_features]), DType::F32, 123).scale(std),
+            weight: Tensor::randn(Shape::new(&[out_features, in_features]), DType::F32, 123)
+                .scale(std),
             last_input: None,
             last_batch: 0,
             dx_buf: None,
@@ -405,7 +408,9 @@ impl Layer for Linear {
 
     impl_single_weight_params!(weight);
 
-    fn set_inference_mode(&mut self, mode: bool) { self.inference_mode = mode; }
+    fn set_inference_mode(&mut self, mode: bool) {
+        self.inference_mode = mode;
+    }
 }
 
 /// SwiGLU feed-forward network (Shazeer 2020).
@@ -492,7 +497,10 @@ impl Layer for SwiGLU {
         let silu_gate = self.last_silu_gate.take().unwrap_or_default();
         let up_out = self.last_up_out.take().unwrap_or_default();
         let input_data = self.last_input.take().unwrap_or_default();
-        let input_shape = self.last_input_shape.take().unwrap_or_else(|| Shape::new(&[]));
+        let input_shape = self
+            .last_input_shape
+            .take()
+            .unwrap_or_else(|| Shape::new(&[]));
 
         let n = gh.len();
         let mut grad_gate = vec![0.0f32; n];

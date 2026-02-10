@@ -89,11 +89,7 @@ impl CrossEntropyLoss {
 pub struct AuxLoss;
 
 impl AuxLoss {
-    pub fn forward(
-        router_probs: &Tensor,
-        expert_indices: &Tensor,
-        n_experts: usize,
-    ) -> Tensor {
+    pub fn forward(router_probs: &Tensor, expert_indices: &Tensor, n_experts: usize) -> Tensor {
         let probs_dims = router_probs.shape().dims();
         assert_eq!(
             probs_dims.len(),
@@ -211,8 +207,13 @@ impl AdamW {
             param.adamw_update(
                 self.m[i].data_mut(),
                 self.v[i].data_mut(),
-                self.lr, self.beta1, self.beta2, self.eps,
-                self.weight_decay, corr1, corr2,
+                self.lr,
+                self.beta1,
+                self.beta2,
+                self.eps,
+                self.weight_decay,
+                corr1,
+                corr2,
             );
         }
     }
@@ -638,4 +639,3 @@ fn checked_target(target: f32, vocab: usize) -> usize {
     assert!(idx < vocab, "target index out of range");
     idx
 }
-

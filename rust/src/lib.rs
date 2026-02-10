@@ -51,7 +51,7 @@ pub use generate::SamplingStrategy;
 pub use layers::{Embedding, ExpertFFN, Layer, Linear, RMSNorm, SwiGLU};
 pub use model::MoETransformer;
 pub use moe::{MoELayer, Router, TransformerBlock};
-pub use tensor::{softmax_in_place, DType, Shape, Tensor, TensorError, TensorResult};
+pub use tensor::{DType, Shape, Tensor, TensorError, TensorResult, softmax_in_place};
 pub use train::{
     AdamW, AuxLoss, CheckpointContext, CheckpointStorage, CrossEntropyLoss, LossScaleMode,
     LossScaler, MasterWeights, MixedPrecisionConfig, TrainConfig, Trainer,

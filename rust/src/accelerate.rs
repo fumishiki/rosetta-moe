@@ -42,8 +42,8 @@ unsafe extern "C" {
 
 // CBLAS enum constants
 const ROW_MAJOR: i32 = 101; // CblasRowMajor
-const NO_TRANS: i32 = 111;  // CblasNoTrans
-const TRANS: i32 = 112;     // CblasTrans
+const NO_TRANS: i32 = 111; // CblasNoTrans
+const TRANS: i32 = 112; // CblasTrans
 
 /// Cast `usize` to `i32` with overflow guard.
 ///
@@ -55,7 +55,10 @@ const TRANS: i32 = 112;     // CblasTrans
 /// For this benchmark's matrices (max dim ~32768), this never fires.
 #[inline(always)]
 fn dim_i32(v: usize) -> i32 {
-    assert!(v <= i32::MAX as usize, "matrix dimension {v} exceeds i32::MAX");
+    assert!(
+        v <= i32::MAX as usize,
+        "matrix dimension {v} exceeds i32::MAX"
+    );
     v as i32
 }
 
@@ -85,13 +88,20 @@ pub fn sgemm(
     // Row-major: lda=k, ldb=n, ldc=n.
     unsafe {
         cblas_sgemm(
-            ROW_MAJOR, NO_TRANS, NO_TRANS,
-            mi, ni, ki,
+            ROW_MAJOR,
+            NO_TRANS,
+            NO_TRANS,
+            mi,
+            ni,
+            ki,
             alpha,
-            a.as_ptr(), ki,
-            b.as_ptr(), ni,
+            a.as_ptr(),
+            ki,
+            b.as_ptr(),
+            ni,
             beta,
-            c.as_mut_ptr(), ni,
+            c.as_mut_ptr(),
+            ni,
         );
     }
 }
@@ -123,13 +133,20 @@ pub fn sgemm_transa(
     // Row-major with A transposed: lda=m, ldb=n, ldc=n.
     unsafe {
         cblas_sgemm(
-            ROW_MAJOR, TRANS, NO_TRANS,
-            mi, ni, ki,
+            ROW_MAJOR,
+            TRANS,
+            NO_TRANS,
+            mi,
+            ni,
+            ki,
             alpha,
-            a.as_ptr(), mi,
-            b.as_ptr(), ni,
+            a.as_ptr(),
+            mi,
+            b.as_ptr(),
+            ni,
             beta,
-            c.as_mut_ptr(), ni,
+            c.as_mut_ptr(),
+            ni,
         );
     }
 }
@@ -161,13 +178,20 @@ pub fn sgemm_transb(
     // Row-major with B transposed: lda=k, ldb=k, ldc=n.
     unsafe {
         cblas_sgemm(
-            ROW_MAJOR, NO_TRANS, TRANS,
-            mi, ni, ki,
+            ROW_MAJOR,
+            NO_TRANS,
+            TRANS,
+            mi,
+            ni,
+            ki,
             alpha,
-            a.as_ptr(), ki,
-            b.as_ptr(), ki,
+            a.as_ptr(),
+            ki,
+            b.as_ptr(),
+            ki,
             beta,
-            c.as_mut_ptr(), ni,
+            c.as_mut_ptr(),
+            ni,
         );
     }
 }
@@ -208,13 +232,20 @@ pub fn sgemm_raw(
     // elements within the M×lda (or K×lda for trans) stride pattern.
     unsafe {
         cblas_sgemm(
-            ROW_MAJOR, ta, tb,
-            mi, ni, ki,
+            ROW_MAJOR,
+            ta,
+            tb,
+            mi,
+            ni,
+            ki,
             alpha,
-            a.as_ptr(), dim_i32(lda),
-            b.as_ptr(), dim_i32(ldb),
+            a.as_ptr(),
+            dim_i32(lda),
+            b.as_ptr(),
+            dim_i32(ldb),
             beta,
-            c.as_mut_ptr(), dim_i32(ldc),
+            c.as_mut_ptr(),
+            dim_i32(ldc),
         );
     }
 }

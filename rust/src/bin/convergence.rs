@@ -24,14 +24,10 @@ fn main() {
     let vocab = 1000;
 
     // Fixed deterministic input (same across all 4 languages)
-    let input_data: Vec<f32> = (0..batch * seq)
-        .map(|i| (i % vocab) as f32)
-        .collect();
+    let input_data: Vec<f32> = (0..batch * seq).map(|i| (i % vocab) as f32).collect();
     let input = Tensor::from_slice(&input_data, Shape::new(&[batch, seq]));
 
-    let target_data: Vec<f32> = (0..batch * seq)
-        .map(|i| ((i + 1) % vocab) as f32)
-        .collect();
+    let target_data: Vec<f32> = (0..batch * seq).map(|i| ((i + 1) % vocab) as f32).collect();
     let targets = Tensor::from_slice(&target_data, Shape::new(&[batch, seq]));
 
     let n_steps = 1000;
@@ -44,5 +40,8 @@ fn main() {
 
     // Output JSON
     let losses_str: Vec<String> = losses.iter().map(|l| format!("{l:.6}")).collect();
-    println!("{{\"language\":\"rust\",\"steps\":{n_steps},\"losses\":[{}]}}", losses_str.join(","));
+    println!(
+        "{{\"language\":\"rust\",\"steps\":{n_steps},\"losses\":[{}]}}",
+        losses_str.join(",")
+    );
 }

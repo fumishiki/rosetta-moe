@@ -238,7 +238,12 @@ pub struct Tensor {
 
 impl Tensor {
     fn from_parts(data: Vec<f32>, shape: Shape, dtype: DType) -> Tensor {
-        Tensor { data, shape, dtype, grad: None }
+        Tensor {
+            data,
+            shape,
+            dtype,
+            grad: None,
+        }
     }
 
     fn like_with_data(&self, data: Vec<f32>) -> Tensor {
@@ -286,7 +291,9 @@ impl Tensor {
         let mut state = seed;
         let mut lcg_uniform = || -> f64 {
             // LCG with Knuth's constants (period 2^64)
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             // Clamp away from 0 to avoid ln(0) = -inf in Box-Muller
             (state as f64 / u64::MAX as f64).clamp(1e-10, 1.0)
         };
@@ -388,7 +395,11 @@ impl Tensor {
             .enumerate()
             .try_fold(0usize, |acc, (axis, (&bound, &i))| {
                 if i >= bound {
-                    Err(TensorError::IndexOutOfBounds { axis, index: i, bound })
+                    Err(TensorError::IndexOutOfBounds {
+                        axis,
+                        index: i,
+                        bound,
+                    })
                 } else {
                     Ok(acc * bound + i)
                 }
@@ -425,14 +436,32 @@ impl Tensor {
         let grad_box = self.grad.take();
         if let Some(ref g) = grad_box {
             crate::simd::adamw_step_simd(
-                &mut self.data, m, v, g.data(),
-                lr, beta1, beta2, eps, weight_decay, corr1, corr2,
+                &mut self.data,
+                m,
+                v,
+                g.data(),
+                lr,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                corr1,
+                corr2,
             );
         } else {
             let zeros = vec![0.0f32; self.data.len()];
             crate::simd::adamw_step_simd(
-                &mut self.data, m, v, &zeros,
-                lr, beta1, beta2, eps, weight_decay, corr1, corr2,
+                &mut self.data,
+                m,
+                v,
+                &zeros,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                corr1,
+                corr2,
             );
         }
         // Put grad back (zero-copy move)
@@ -482,7 +511,12 @@ impl Tensor {
 
     fn map_binary(&self, other: &Tensor, op: impl Fn(f32, f32) -> f32) -> TensorResult<Tensor> {
         self.ensure_same_shape(other)?;
-        let out = self.data.iter().zip(&other.data).map(|(&a, &b)| op(a, b)).collect();
+        let out = self
+            .data
+            .iter()
+            .zip(&other.data)
+            .map(|(&a, &b)| op(a, b))
+            .collect();
         Ok(self.like_with_data(out))
     }
 
@@ -543,7 +577,8 @@ impl Tensor {
         if self.shape.dims().is_empty() {
             return self.clone();
         }
-        self.sum_last_dim().scale(1.0 / self.shape.last_dim() as f32)
+        self.sum_last_dim()
+            .scale(1.0 / self.shape.last_dim() as f32)
     }
 
     /// Applies softmax along the last dimension, writing result into `out`.
@@ -597,7 +632,10 @@ impl Tensor {
         let (m, k) = self.try_matrix_dims()?;
         let (k2, n) = other.try_matrix_dims()?;
         if k != k2 {
-            return Err(TensorError::MatmulInnerMismatch { lhs_k: k, rhs_k: k2 });
+            return Err(TensorError::MatmulInnerMismatch {
+                lhs_k: k,
+                rhs_k: k2,
+            });
         }
 
         let batch = self.shape.batch_size();
@@ -633,7 +671,10 @@ impl Tensor {
         let stride = m * n;
         let mut out = vec![0.0; self.numel()];
 
-        for (src_batch, dst_batch) in self.data.chunks_exact(stride).zip(out.chunks_exact_mut(stride))
+        for (src_batch, dst_batch) in self
+            .data
+            .chunks_exact(stride)
+            .zip(out.chunks_exact_mut(stride))
         {
             for i in 0..m {
                 for j in 0..n {

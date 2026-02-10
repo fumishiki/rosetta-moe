@@ -19,7 +19,7 @@ use std::cell::RefCell;
 
 use crate::attention::MQAttention;
 use crate::config::Config;
-use crate::layers::{collect_params, collect_params_mut, ExpertFFN, Layer, Linear, RMSNorm};
+use crate::layers::{ExpertFFN, Layer, Linear, RMSNorm, collect_params, collect_params_mut};
 use crate::tensor::{Shape, Tensor};
 
 /// Learned router that assigns tokens to experts.

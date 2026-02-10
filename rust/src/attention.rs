@@ -14,7 +14,7 @@
 //!   where theta_i = pos * base^(-2i/d)
 
 use crate::config::Config;
-use crate::layers::{collect_params, collect_params_mut, Layer, Linear};
+use crate::layers::{Layer, Linear, collect_params, collect_params_mut};
 use crate::tensor::{self, Shape, Tensor};
 
 /// Multi-Query Attention with RoPE.
@@ -181,12 +181,10 @@ impl Layer for MQAttention {
 
                 // Step 3-4: Compute scaled dot-product scores with causal masking
                 for qi in 0..seq_len {
-                    let q_off =
-                        ((b * seq_len + qi) * self.n_heads + h) * self.head_dim;
+                    let q_off = ((b * seq_len + qi) * self.n_heads + h) * self.head_dim;
 
                     for ki in 0..=qi {
-                        let k_off =
-                            ((b * seq_len + ki) * self.n_kv_heads + kv_h) * self.head_dim;
+                        let k_off = ((b * seq_len + ki) * self.n_kv_heads + kv_h) * self.head_dim;
                         let mut dot = 0.0;
                         for d in 0..self.head_dim {
                             dot += q_data[q_off + d] * k_data[k_off + d];
@@ -214,12 +212,10 @@ impl Layer for MQAttention {
 
                 // Step 6: Weighted sum of V
                 for qi in 0..seq_len {
-                    let out_off =
-                        ((b * seq_len + qi) * self.n_heads + h) * self.head_dim;
+                    let out_off = ((b * seq_len + qi) * self.n_heads + h) * self.head_dim;
                     for ki in 0..=qi {
                         let w = scores[qi * seq_len + ki];
-                        let v_off =
-                            ((b * seq_len + ki) * self.n_kv_heads + kv_h) * self.head_dim;
+                        let v_off = ((b * seq_len + ki) * self.n_kv_heads + kv_h) * self.head_dim;
                         for d in 0..self.head_dim {
                             attn_out[out_off + d] += w * v_data[v_off + d];
                         }
@@ -266,7 +262,10 @@ impl Layer for MQAttention {
         let v_data = self.last_v.take().unwrap_or_default();
         let attn_weights = self.last_attn_weights.take().unwrap_or_default();
         let input_data = self.last_input.take().unwrap_or_default();
-        let input_shape = self.last_input_shape.take().unwrap_or_else(|| Shape::new(&[]));
+        let input_shape = self
+            .last_input_shape
+            .take()
+            .unwrap_or_else(|| Shape::new(&[]));
 
         // Reuse or allocate gradient buffers for Q, K, V
         // Layout: [batch, seq, heads, head_dim] flattened
@@ -288,8 +287,8 @@ impl Layer for MQAttention {
         grad_scores.resize(seq_len * seq_len, 0.0);
 
         let hd = self.head_dim;
-        let q_stride = self.n_heads * hd;       // stride between rows in Q layout
-        let kv_stride = self.n_kv_heads * hd;   // stride between rows in K/V layout
+        let q_stride = self.n_heads * hd; // stride between rows in Q layout
+        let kv_stride = self.n_kv_heads * hd; // stride between rows in K/V layout
 
         for b in 0..batch {
             for h in 0..self.n_heads {
@@ -299,7 +298,7 @@ impl Layer for MQAttention {
                 // Base offsets into strided arrays for this (b, h)
                 let q_base = b * seq_len * q_stride + h * hd;
                 let kv_base = b * seq_len * kv_stride + kv_h * hd;
-                let go_base = q_base;  // same layout as Q
+                let go_base = q_base; // same layout as Q
                 let gq_base = q_base;
                 let gk_base = kv_base;
                 let gv_base = kv_base;
@@ -309,24 +308,36 @@ impl Layer for MQAttention {
                 //    dO: [S,D] strided at go_base, ldb=q_stride
                 //    gV: [S,D] strided at gv_base, ldc=kv_stride, beta=1.0 (GQA accumulate)
                 crate::accelerate::sgemm_raw(
-                    true, false,
-                    seq_len, hd, seq_len,
+                    true,
+                    false,
+                    seq_len,
+                    hd,
+                    seq_len,
                     1.0,
-                    &attn_weights[w_off..], seq_len,
-                    &grad_o_data[go_base..], q_stride,
+                    &attn_weights[w_off..],
+                    seq_len,
+                    &grad_o_data[go_base..],
+                    q_stride,
                     1.0,
-                    &mut grad_v[gv_base..], kv_stride,
+                    &mut grad_v[gv_base..],
+                    kv_stride,
                 );
 
                 // 3. grad_W = dO[b,h] @ V[b,kv_h]^T  → [S,S]
                 crate::accelerate::sgemm_raw(
-                    false, true,
-                    seq_len, seq_len, hd,
+                    false,
+                    true,
+                    seq_len,
+                    seq_len,
+                    hd,
                     1.0,
-                    &grad_o_data[go_base..], q_stride,
-                    &v_data[kv_base..], kv_stride,
+                    &grad_o_data[go_base..],
+                    q_stride,
+                    &v_data[kv_base..],
+                    kv_stride,
                     0.0,
-                    &mut grad_scores, seq_len,
+                    &mut grad_scores,
+                    seq_len,
                 );
 
                 // 4. Softmax backward (element-wise, stays scalar)
@@ -349,24 +360,36 @@ impl Layer for MQAttention {
 
                 // 5. grad_Q[b,h] = scale * grad_scores @ K[b,kv_h]
                 crate::accelerate::sgemm_raw(
-                    false, false,
-                    seq_len, hd, seq_len,
+                    false,
+                    false,
+                    seq_len,
+                    hd,
+                    seq_len,
                     self.scale,
-                    &grad_scores, seq_len,
-                    &k_data[kv_base..], kv_stride,
+                    &grad_scores,
+                    seq_len,
+                    &k_data[kv_base..],
+                    kv_stride,
                     0.0,
-                    &mut grad_q[gq_base..], q_stride,
+                    &mut grad_q[gq_base..],
+                    q_stride,
                 );
 
                 // 6. grad_K[b,kv_h] += scale * grad_scores^T @ Q[b,h]
                 crate::accelerate::sgemm_raw(
-                    true, false,
-                    seq_len, hd, seq_len,
+                    true,
+                    false,
+                    seq_len,
+                    hd,
+                    seq_len,
                     self.scale,
-                    &grad_scores, seq_len,
-                    &q_data[q_base..], q_stride,
+                    &grad_scores,
+                    seq_len,
+                    &q_data[q_base..],
+                    q_stride,
                     1.0,
-                    &mut grad_k[gk_base..], kv_stride,
+                    &mut grad_k[gk_base..],
+                    kv_stride,
                 );
             }
         }

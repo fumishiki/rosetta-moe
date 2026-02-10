@@ -55,7 +55,11 @@ pub fn generate(
     strategy: &SamplingStrategy,
     seed: u64,
 ) -> Vec<usize> {
-    let mut tokens = if prompt.is_empty() { vec![0] } else { prompt.to_vec() };
+    let mut tokens = if prompt.is_empty() {
+        vec![0]
+    } else {
+        prompt.to_vec()
+    };
     let mut state = seed;
     let vocab = model.config().vocab_size;
 
