@@ -1,572 +1,197 @@
-# Go Implementation
+# Go MoE Transformer
 
-MoE Transformer (6.9B/1.8B) の Go 実装。
+From-scratch Mixture-of-Experts Transformer in Go.
+Zero external dependencies beyond the standard library and Apple Accelerate via CGO.
 
-## Structure
+## Architecture
 
 ```
 go/
-├── tensor/     # Tensor operations (Shape, DType, Tensor)
-├── cuda/       # cgo CUDA bindings + Makefile
-├── layer/      # NN layers (Embedding, RMSNorm, Linear, SwiGLU)
-├── model/      # Model (Attention, Router, MoE, Transformer)
-├── train/      # Training (Trainer, AdamW, LR scheduler)
-└── go.mod      # Module definition
+├── tensor.go       # Tensor type, flat []float32 storage, pure-f32 math (exp/sqrt/log/sin/cos)
+├── config.go       # Model hyperparameters (Default6_9B, Tiny presets)
+├── layers.go       # Embedding, Linear, RMSNorm, SwiGLU
+├── attention.go    # Multi-Query Attention with RoPE (causal, NTK-aware scaling)
+├── moe.go          # Router (top-K gating), MoELayer (sparse dispatch), TransformerBlock
+├── model.go        # MoETransformer (full model assembly)
+├── generate.go     # Sampling strategies (greedy, temperature, top-K, top-P)
+├── train.go        # CrossEntropy loss, AdamW optimizer, LR schedule, checkpointing, loss scaling
+├── sgemm.go        # Apple Accelerate CGO wrapper (cblas_sgemm)
+├── bench_test.go   # Benchmark harness (4 axes: memory, compiler, type system, parallel)
+├── nn_test.go      # Unit and integration tests
+└── go.mod          # Module definition (Go 1.22+)
 ```
 
-## Build
+All files belong to package `nn`. No subdirectories.
 
-### 1. Build CUDA Library
+## Equation-to-Code Map
 
-```bash
-cd cuda
-make
+| Formula | File | Function |
+|---------|------|----------|
+| `C = A @ B` (GEMM) | `sgemm.go` | `sgemm()` |
+| `C = A @ B^T` | `sgemm.go` | `sgemmTransB()` |
+| `Softmax: p_i = exp(x_i - max) / sum(exp(x_j - max))` | `tensor.go` | `Softmax()` |
+| `SiLU(x) = x / (1 + exp(-x))` | `tensor.go` | `SiLU()` |
+| `RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma` | `layers.go` | `RMSNorm.Forward()` |
+| `Linear: y = x @ W^T + b` | `layers.go` | `Linear.Forward()` |
+| `Embedding: out[b,s] = W[token_id]` | `layers.go` | `Embedding.Forward()` |
+| `SwiGLU: out = W_down @ (SiLU(W_gate @ x) * W_up @ x)` | `layers.go` | `SwiGLU.Forward()` |
+| `RoPE: [x0,x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]` | `attention.go` | `applyRoPE()` |
+| `Attention: softmax(Q@K^T/sqrt(d)) @ V` | `attention.go` | `MQAttention.Forward()` |
+| `MoE: out = sum_k(w_k * Expert_k(x))` | `moe.go` | `MoELayer.Forward()` |
+| `Gate: probs = softmax(W_gate @ x), top-K select` | `moe.go` | `Router.Forward()` |
+| `AuxLoss: alpha * N * sum(f_e * P_e)` | `moe.go` | `Router.ComputeAuxLoss()` |
+| `CrossEntropy: L = -mean(log(softmax(logits)[target]))` | `train.go` | `crossEntropyLoss()` |
+| `CE Grad: (softmax(logits) - one_hot) / N` | `train.go` | `crossEntropyGrad()` |
+| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat/(sqrt(v_hat)+e)+wd*w)` | `train.go` | `Trainer.TrainStep()` |
+| `LR Schedule: warmup linear + cosine decay` | `train.go` | `Trainer.GetLR()` |
+| `Grad Clip: t *= clip/(norm+eps) if norm > clip` | `train.go` | `clipTensorByGlobalNorm()` |
+| `exp(x) = 2^k * Horner(r)` | `tensor.go` | `ExpF32()` |
+| `sqrt(x) = x * fast_inv_sqrt(x)` (Quake III + Newton) | `tensor.go` | `SqrtF32()` |
+| `ln(x) = e*ln2 + atanh_poly(m)` | `tensor.go` | `LogF32()` |
+
+## Implementation Notes
+
+### CGO Accelerate Integration (`sgemm.go`)
+
+Matrix multiplication is delegated to Apple Accelerate's `cblas_sgemm`, which routes
+through the AMX coprocessor on Apple Silicon (7-14x faster than NEON SIMD).
+
+The CGO bridge is minimal: two thin wrappers (`sgemm` and `sgemmTransB`) that convert
+Go types to C types. Key details:
+
+- **Framework linking**: `#cgo LDFLAGS: -framework Accelerate` -- no static library needed
+- **Pointer conversion**: `(*C.float)(unsafe.Pointer(&slice[0]))` extracts the raw data
+  pointer from the Go slice header. CGO pins this pointer for the duration of the C call.
+- **Empty slice guard**: Both functions return early if any dimension is 0. Without this,
+  `&slice[0]` panics on nil/empty slices -- the most common CGO pitfall.
+- **No `CblasTrans` for A**: Weight is stored as `[out, in]` so `sgemmTransB` applies
+  `CblasTrans` only on B, avoiding a separate transpose allocation.
+
+### Flat `[]float32` as Tensor Storage
+
+There is no generic tensor library. `Tensor` is simply:
+```go
+type Tensor struct {
+    data  []float32  // contiguous row-major storage
+    shape Shape      // dimension metadata
+    dtype DType      // type tag (only F32 used at runtime)
+    Grad  []float32  // per-parameter gradient (nil until first backward)
+}
 ```
 
-This builds `lib/libcudann.a`:
-- **With CUDA**: Compiles `.cu` kernels from `../../cuda/kernels/`
-- **Without CUDA**: Compiles `stub.c` (CPU fallback)
+`Grad` is lazily allocated: it stays nil until the first backward pass accumulates a gradient into it via `AccumulateGrad()`. `ZeroGrad()` zeros in place if allocated, stays nil otherwise. AdamW reads each parameter's `Grad` to update weights.
 
-### 2. Build Go
+Index calculations use row-major strides. For a `[batch, seq, hidden]` tensor, the flat
+offset of element `[b, s, h]` is `b*seq*hidden + s*hidden + h`. The `splitLast` helper peels
+off leading dimensions so that all matmul operations work on 2D `[batch_total, features]`.
+
+In-place variants (`AddInPlace`, `MulInPlace`, `SiLUInPlace`, `ScaleInPlace`) mutate the
+receiver tensor directly, eliminating temporary allocations in the SwiGLU and attention
+hot paths. Combined with `SoftmaxInto` (pre-allocated output), these keep per-forward
+allocation pressure manageable for the GC.
+
+### Goroutine Parallel Model
+
+The benchmark's parallel axis uses one independent model per goroutine with `sync.WaitGroup`:
+
+```go
+var wg sync.WaitGroup
+wg.Add(N)
+for i := 0; i < N; i++ {
+    m, inp := models[i], inputs[i]  // capture before goroutine
+    go func() {
+        defer wg.Done()
+        m.Forward(inp)  // no shared state
+    }()
+}
+wg.Wait()
+```
+
+No locks, no channels for data -- each goroutine owns its model and input exclusively.
+This tests pure goroutine scheduling overhead and GC behavior under parallel allocation.
+
+### GC Behavior Under ML Workload
+
+The benchmark measures `gc_throughput = 1.0 - (gc_time / total_compute_time)`. Typical
+values are 0.987-0.993 across all scenarios, meaning GC consumes less than 1.3% of runtime at worst. This is because:
+
+- Tensor data is large contiguous `[]float32` slices (easy for GC to scan)
+- Most allocations are short-lived intermediates (per-layer outputs) that die young
+- Hot-path layers reuse buffers across calls (`RMSNorm.lastRMS`, `Router.softmaxBuf`, `MoELayer.outBuf`, `MQAttention.scoresBuf/attnOutBuf`) to reduce allocation frequency
+
+## Performance Characteristics
+
+Latest benchmark results (M1, batch=2, seq=32, hidden=64):
+
+| Metric | Value | Rank (of 4 languages) |
+|--------|-------|------|
+| Forward pass | 1.28ms | 3rd (Rust 0.55ms, Julia 0.56ms) |
+| Train step | 1.93ms | 3rd (Julia 0.49ms, Rust 0.58ms) |
+| Matmul 64×64 | 296 GFLOPS | 3rd |
+| Softmax kernel | 6.0us | 3rd (Rust 2.2us, Julia 4.9us) |
+| Peak RSS | 25MB | 2nd (Rust 14MB) |
+| T4 throughput | 1,948 inf/s | 4th (tied with Python 1,968) |
+| GC throughput | 0.987-0.993 | Best among GC languages |
+
+**GC is invisible**: 19.5M bytes allocated per forward pass, yet GC throughput never drops below 0.987. Go's concurrent tracing GC is tuned for latency — it sacrifices throughput headroom to minimize pause impact. Under this ML workload, GC is a non-issue.
+
+**CGO overhead is the bottleneck**: ~1us per BLAS call. At 64×64 this is ~2x Rust's direct FFI overhead. At production matrix sizes (1024+), the overhead would be negligible.
+
+**Compiler optimization ceiling**: Go's compiler (gc) is designed for fast compilation, not peak codegen. Without LLVM, it cannot auto-vectorize or exploit SIMD. softmax (6.0us) is 3x Rust (2.2us) — this is the compiler gap, not the language.
+
+**Go's value proposition is not "fastest" — it's "fast enough with lowest total cost of ownership."** Simplest codebase, fastest compilation, most straightforward deployment.
+
+## Gotchas / Pitfalls
+
+### Empty Slice Panic at CGO Boundary
+
+```go
+// PANICS if data is nil or empty:
+(*C.float)(unsafe.Pointer(&data[0]))
+
+// SAFE: always check length first
+if len(data) == 0 {
+    return
+}
+```
+
+Both `sgemm()` and `sgemmTransB()` have this guard. Any new CGO wrapper must include it.
+
+### CGO Overhead for Small Matrices
+
+Each CGO call costs ~100ns-1us (goroutine stack switch + runtime state save). For a 64x64
+matmul (~524K FLOPS), the compute time is ~1us, so CGO overhead is ~50% of total time.
+For production-size matrices (512+ dimensions), the overhead is negligible (<1%).
+
+The benchmark's `kernel_matmul` scenario specifically measures this to quantify CGO
+amortization.
+
+### Allocation Rate Measurement
+
+The benchmark snapshots `runtime.MemStats.TotalAlloc` before and after the timed trials
+(not including warmup). The per-trial allocation rate is:
+
+```
+alloc_rate = (total_alloc_after - total_alloc_before) / num_trials / median_wall_seconds
+```
+
+This gives bytes/sec of heap allocation during steady-state operation, excluding one-time
+setup costs.
+
+## Build and Test
 
 ```bash
+# Test (excludes bench by default since TestBench is slow)
+go test -run 'Test[^B]' ./...
+
+# Full test including benchmark
+go test -v -count=1 -timeout 300s ./...
+
+# Build check
 go build ./...
 ```
 
-### 3. Test
-
-```bash
-go test ./...
-```
-
-## Dependencies
-
+Requires:
 - Go 1.22+
-- GCC (for cgo)
-- CUDA Toolkit (optional, for GPU acceleration)
-
-## Usage
-
-```go
-package main
-
-import (
-    "fmt"
-    "github.com/fumi-engineer/machine_learning/go/model"
-)
-
-func main() {
-    // Create tiny model for testing
-    m := model.NewTiny()
-
-    // Forward pass
-    tokenIDs := []int{1, 2, 3, 4}
-    logits := m.ForwardIDs(tokenIDs, 1, 4)
-
-    fmt.Printf("Output shape: %v\n", logits.Shape())
-}
-```
-
-## CUDA Functions
-
-The `cuda` package provides Go bindings to:
-
-| Function | Description |
-|----------|-------------|
-| SiLU | SiLU activation |
-| Add/Mul/Scale | Element-wise ops |
-| Softmax | Softmax |
-| RMSNorm | RMS normalization |
-| GEMM | Matrix multiplication |
-| CrossEntropyForward | Loss computation |
-| AdamWStep | Optimizer step |
-| Argmax | Greedy decoding |
-| Sample | Multinomial sampling |
-| TopKSample | Top-k sampling |
-| TopPSample | Nucleus sampling |
-
-## FFI Bridge Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Go Application                          │
-├─────────────────────────────────────────────────────────────┤
-│  go/cuda/cuda.go                                            │
-│  ├── cgo declarations (extern "C" function prototypes)      │
-│  ├── Go wrapper functions (SiLU, Add, GEMM, etc.)           │
-│  └── Error handling (ErrCudaNotAvailable)                   │
-├─────────────────────────────────────────────────────────────┤
-│  go/cuda/lib/libcudann.a                                    │
-│  └── Static library (CUDA kernels or stub)                  │
-├─────────────────────────────────────────────────────────────┤
-│  ../../cuda/kernels/*.cu  OR  ../../cuda/stub.c             │
-│  └── Actual implementations                                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### cgo Binding Details
-
-```go
-/*
-#cgo CFLAGS: -I${SRCDIR}/../../cuda/kernels
-#cgo LDFLAGS: -L${SRCDIR}/lib -lcudann
-
-extern int32_t cuda_silu(const float* input, float* output, int64_t n, void* stream);
-*/
-import "C"
-```
-
-**Key Points:**
-- `#cgo CFLAGS`: Include path for kernel headers
-- `#cgo LDFLAGS`: Link against `libcudann.a`
-- All FFI functions return `int32_t` (0=success, -1=not available)
-- `void* stream` parameter for CUDA stream (nil for default)
-
-### Error Handling
-
-```go
-var ErrCudaNotAvailable = errors.New("CUDA not available")
-
-func checkResult(code C.int32_t) error {
-    if code != 0 {
-        return ErrCudaNotAvailable
-    }
-    return nil
-}
-```
-
-### Testing
-
-```bash
-# Build stub library and run tests
-cd go/cuda && make && go test -v ./...
-```
-
-Tests verify:
-1. Input validation (length mismatch errors)
-2. Stub returns `ErrCudaNotAvailable` when CUDA unavailable
-3. All exported functions have correct signatures
-
-## Notes
-
-- CPU implementation works without CUDA (stub returns error)
-- GPU functions require CUDA library to be built with nvcc
-- Static library `.a` is linked at compile time via cgo
-
----
-
-## FFI Technical Reference
-
-### cgo Fundamentals
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     cgo Call Flow                           │
-├─────────────────────────────────────────────────────────────┤
-│  Go code                                                    │
-│    ↓                                                        │
-│  cgo runtime (stack switch, GC coordination)                │
-│    ↓                                                        │
-│  C function call                                            │
-│    ↓                                                        │
-│  Return to cgo runtime                                      │
-│    ↓                                                        │
-│  Go code continues                                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Overhead:** Each cgo call costs ~100-200ns due to:
-- Stack switching (Go stack → C stack)
-- Saving/restoring Go runtime state
-- Potential GC coordination
-
-### Memory Pinning
-
-```go
-// CRITICAL: Go slices must not move during C call
-// The Go runtime may move memory during GC
-
-// SAFE: Pointer derived from slice element
-func SiLU(input, output []float32, stream Stream) error {
-    // &input[0] pins the backing array during this call
-    return checkResult(C.cuda_silu(
-        (*C.float)(&input[0]),   // Pinned by cgo
-        (*C.float)(&output[0]),  // Pinned by cgo
-        C.int64_t(len(input)),
-        unsafe.Pointer(stream),
-    ))
-}
-
-// UNSAFE: Don't store pointer for later use
-func Bad() *C.float {
-    data := []float32{1, 2, 3}
-    ptr := (*C.float)(&data[0])
-    return ptr  // DANGER: data may move after function returns!
-}
-```
-
-**cgo Pointer Rules:**
-1. Go pointer passed to C is valid only during the call
-2. C cannot store Go pointers beyond the call duration
-3. Go cannot pass pointers to Go memory that itself contains pointers
-
-### Type Conversions
-
-```go
-import "C"
-import "unsafe"
-
-// Slice to C pointer
-func sliceToPtr(s []float32) *C.float {
-    if len(s) == 0 {
-        return nil  // Handle empty slice
-    }
-    return (*C.float)(&s[0])
-}
-
-// Go types to C types
-var (
-    _ C.float   = C.float(float32(0))    // float32 → C.float
-    _ C.int     = C.int(int32(0))        // int32 → C.int
-    _ C.int32_t = C.int32_t(int32(0))    // int32 → C.int32_t
-    _ C.int64_t = C.int64_t(int64(0))    // int64 → C.int64_t
-    _ C.uint64_t = C.uint64_t(uint64(0)) // uint64 → C.uint64_t
-)
-
-// Opaque pointer (void*)
-func ptrToVoid(p unsafe.Pointer) unsafe.Pointer {
-    return p  // Go's unsafe.Pointer ≡ C's void*
-}
-```
-
-### Goroutine Considerations
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│              Goroutines and cgo                             │
-├─────────────────────────────────────────────────────────────┤
-│  ✓ Multiple goroutines can call cgo concurrently           │
-│  ✓ Each cgo call gets its own OS thread                    │
-│  ✗ cgo calls block the OS thread (not just the goroutine)  │
-│  ⚠ Many concurrent cgo calls = many OS threads             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-```go
-// Pattern: Limit concurrent cgo calls
-var cgoSemaphore = make(chan struct{}, runtime.NumCPU())
-
-func SiLUThrottled(input, output []float32, stream Stream) error {
-    cgoSemaphore <- struct{}{}        // Acquire
-    defer func() { <-cgoSemaphore }() // Release
-
-    return SiLU(input, output, stream)
-}
-```
-
-### CUDA Stream Management
-
-```go
-// Stream represents a CUDA stream (nil for default stream)
-type Stream unsafe.Pointer
-
-// DefaultStream is the default CUDA stream
-var DefaultStream Stream = nil
-
-// Best Practice: One stream per goroutine for parallel execution
-func ParallelKernels(inputs [][]float32, outputs [][]float32) error {
-    var wg sync.WaitGroup
-    errCh := make(chan error, len(inputs))
-
-    for i := range inputs {
-        wg.Add(1)
-        go func(idx int) {
-            defer wg.Done()
-            // Each goroutine uses DefaultStream
-            // Kernels execute sequentially on GPU
-            if err := SiLU(inputs[idx], outputs[idx], DefaultStream); err != nil {
-                errCh <- err
-            }
-        }(i)
-    }
-
-    wg.Wait()
-    close(errCh)
-
-    for err := range errCh {
-        if err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-### Error Handling Patterns
-
-```go
-// Sentinel error for CUDA unavailable
-var ErrCudaNotAvailable = errors.New("CUDA not available")
-
-// Detailed error type (optional)
-type CudaError struct {
-    Code    int
-    Message string
-}
-
-func (e CudaError) Error() string {
-    return fmt.Sprintf("CUDA error %d: %s", e.Code, e.Message)
-}
-
-// Error code mapping
-func checkResultDetailed(code C.int32_t) error {
-    switch code {
-    case 0:
-        return nil
-    case -1:
-        return ErrCudaNotAvailable
-    case -2:
-        return CudaError{Code: -2, Message: "invalid argument"}
-    case -3:
-        return CudaError{Code: -3, Message: "kernel execution failed"}
-    case -4:
-        return CudaError{Code: -4, Message: "out of GPU memory"}
-    default:
-        return CudaError{Code: int(code), Message: "unknown error"}
-    }
-}
-
-// Usage with errors.Is
-func Example() {
-    err := SiLU(input, output, DefaultStream)
-    if errors.Is(err, ErrCudaNotAvailable) {
-        // Fall back to CPU implementation
-        cpuSiLU(input, output)
-    } else if err != nil {
-        log.Fatal(err)
-    }
-}
-```
-
-### Input Validation
-
-```go
-// Validate before cgo call to prevent buffer overflows
-func SiLU(input, output []float32, stream Stream) error {
-    // Length validation
-    if len(input) != len(output) {
-        return errors.New("input and output must have same length")
-    }
-
-    // Empty slice check (avoid nil pointer)
-    if len(input) == 0 {
-        return nil  // No-op for empty input
-    }
-
-    return checkResult(C.cuda_silu(
-        (*C.float)(&input[0]),
-        (*C.float)(&output[0]),
-        C.int64_t(len(input)),
-        unsafe.Pointer(stream),
-    ))
-}
-
-// Matrix dimension validation
-func GEMM(A, B, C []float32, M, N, K int, alpha, beta float32, stream Stream) error {
-    // Validate buffer sizes
-    if len(A) < M*K {
-        return fmt.Errorf("A buffer too small: need %d, got %d", M*K, len(A))
-    }
-    if len(B) < K*N {
-        return fmt.Errorf("B buffer too small: need %d, got %d", K*N, len(B))
-    }
-    if len(C) < M*N {
-        return fmt.Errorf("C buffer too small: need %d, got %d", M*N, len(C))
-    }
-
-    return checkResult(C.cuda_gemm(
-        (*C.float)(&A[0]),
-        (*C.float)(&B[0]),
-        (*C.float)(&C[0]),
-        C.int(M), C.int(N), C.int(K),
-        C.float(alpha), C.float(beta),
-        unsafe.Pointer(stream),
-    ))
-}
-```
-
-### Build System (Makefile)
-
-```makefile
-# go/cuda/Makefile
-
-CUDA_PATH ?= /usr/local/cuda
-CUDA_KERNELS = ../../cuda/kernels
-STUB_SRC = ../../cuda/stub.c
-
-# Detect CUDA
-ifeq ($(wildcard $(CUDA_PATH)/bin/nvcc),)
-    USE_CUDA = 0
-else
-    USE_CUDA = 1
-endif
-
-# GPU architectures (match Rust build.rs)
-GPU_ARCHS = -gencode arch=compute_70,code=sm_70 \
-            -gencode arch=compute_80,code=sm_80 \
-            -gencode arch=compute_89,code=sm_89
-
-ifeq ($(USE_CUDA),1)
-# With CUDA: compile .cu files
-$(LIB_DIR)/$(LIB_NAME): $(CUDA_OBJS)
-    ar rcs $@ $^
-else
-# Without CUDA: compile stub
-$(LIB_DIR)/$(LIB_NAME): $(LIB_DIR)/stub.o
-    ar rcs $@ $^
-endif
-```
-
-### Common Pitfalls
-
-#### 1. Slice Header vs Data
-
-```go
-// WRONG: Passing slice header (struct) instead of data pointer
-func bad(data []float32) {
-    C.kernel(unsafe.Pointer(&data))  // Passes slice header!
-}
-
-// CORRECT: Pass pointer to first element
-func good(data []float32) {
-    C.kernel((*C.float)(&data[0]))  // Passes data pointer
-}
-```
-
-#### 2. Empty Slice Panic
-
-```go
-// WRONG: Panics on empty slice
-func bad(data []float32) {
-    C.kernel((*C.float)(&data[0]))  // panic: index out of range
-}
-
-// CORRECT: Handle empty slice
-func good(data []float32) {
-    if len(data) == 0 {
-        return nil
-    }
-    C.kernel((*C.float)(&data[0]))
-}
-```
-
-#### 3. Goroutine Leak with Long-Running C Calls
-
-```go
-// PROBLEM: C call blocks forever
-func bad() {
-    go func() {
-        C.blocking_kernel()  // Never returns
-    }()
-}
-
-// SOLUTION: Use context for cancellation
-func good(ctx context.Context) error {
-    done := make(chan error, 1)
-    go func() {
-        code := C.kernel_with_timeout()
-        done <- checkResult(code)
-    }()
-
-    select {
-    case err := <-done:
-        return err
-    case <-ctx.Done():
-        // Cannot actually cancel C call, but can stop waiting
-        return ctx.Err()
-    }
-}
-```
-
-#### 4. CGO_ENABLED=0 Breaks Build
-
-```bash
-# This fails because cgo is disabled
-CGO_ENABLED=0 go build ./...
-
-# Must enable cgo for CUDA package
-CGO_ENABLED=1 go build ./...
-```
-
-### Performance Optimization
-
-```go
-// Batch operations to amortize cgo overhead
-func BatchSiLU(inputs, outputs [][]float32, stream Stream) error {
-    for i := range inputs {
-        if err := SiLU(inputs[i], outputs[i], stream); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-
-// Better: Single kernel for batched input
-func SiLUBatched(input, output []float32, batchSize, dim int, stream Stream) error {
-    // Single cgo call for entire batch
-    return checkResult(C.cuda_silu(
-        (*C.float)(&input[0]),
-        (*C.float)(&output[0]),
-        C.int64_t(batchSize * dim),
-        unsafe.Pointer(stream),
-    ))
-}
-```
-
-### Testing Patterns
-
-```go
-func TestSiLUStub(t *testing.T) {
-    input := []float32{1.0, 2.0, 3.0, 4.0}
-    output := make([]float32, 4)
-
-    err := SiLU(input, output, DefaultStream)
-
-    // With stub, should return ErrCudaNotAvailable
-    if !errors.Is(err, ErrCudaNotAvailable) {
-        t.Errorf("expected ErrCudaNotAvailable, got: %v", err)
-    }
-}
-
-func TestInputValidation(t *testing.T) {
-    tests := []struct {
-        name   string
-        input  []float32
-        output []float32
-        want   string
-    }{
-        {"length mismatch", []float32{1, 2, 3}, []float32{0, 0}, "same length"},
-        {"empty slices", []float32{}, []float32{}, ""},  // Should succeed (no-op)
-    }
-
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            err := SiLU(tt.input, tt.output, DefaultStream)
-            if tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)) {
-                t.Errorf("expected error containing %q, got %v", tt.want, err)
-            }
-        })
-    }
-}
-
-// Benchmark cgo overhead
-func BenchmarkCgoOverhead(b *testing.B) {
-    input := make([]float32, 1024)
-    output := make([]float32, 1024)
-
-    b.ResetTimer()
-    for i := 0; i < b.N; i++ {
-        _ = SiLU(input, output, DefaultStream)
-    }
-}
-```
+- macOS with Xcode Command Line Tools (for Accelerate framework)
+- CGO enabled (default on macOS)

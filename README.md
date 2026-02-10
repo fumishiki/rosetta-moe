@@ -1,315 +1,368 @@
-# cuda-nn
+# machine_learning
 
 [![CI](https://github.com/fumi-engineer/machine_learning/actions/workflows/ci.yml/badge.svg)](https://github.com/fumi-engineer/machine_learning/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange)
 ![Go](https://img.shields.io/badge/Go-1.22-blue)
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
+![Julia](https://img.shields.io/badge/Julia-1.10+-purple)
 
-**MoE Transformer (6.9B / 1.8B active) — Rust + Go + Python + CUDA from scratch**
+**Same MoE Transformer. 4 languages. 22 benchmark scenarios. One hardware.**
 
-## Architecture
+Rust, Go, Python, Julia — each implements the same MoE Transformer from scratch (forward, backward, optimizer, inference). All matmul hits the same Apple Accelerate BLAS on the same M1. No frameworks — every gradient is hand-derived.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    MoE Transformer                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │  Embedding  │→ │ Blocks × 30 │→ │  LM Head    │         │
-│  └─────────────┘  └─────────────┘  └─────────────┘         │
-│                          ↓                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │              Transformer Block                        │  │
-│  │  ┌─────────┐    ┌───────────┐    ┌─────────┐         │  │
-│  │  │ RMSNorm │ →  │    MQA    │ →  │ RMSNorm │ → MoE   │  │
-│  │  └─────────┘    │ (12Q/1KV) │    └─────────┘         │  │
-│  │       ↑         └───────────┘         ↑     ↓        │  │
-│  │       └──────── residual ─────────────┴─ residual ───│  │
-│  └──────────────────────────────────────────────────────┘  │
-│                          ↓                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                   MoE Layer                           │  │
-│  │  ┌────────┐   ┌─────────────────────────────────┐    │  │
-│  │  │ Router │ → │ Expert 0  │ ... │  Expert 15   │    │  │
-│  │  │ top-4  │   │ (SwiGLU)  │     │  (SwiGLU)    │    │  │
-│  │  └────────┘   └─────────────────────────────────┘    │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-```
+## Results
 
-## Model Specs
+| | Forward | Train | T4 Inference | T4 Training | softmax | RSS |
+|---|---|---|---|---|---|---|
+| **Rust** | **0.57 ms** | 1.31 ms | **4,738 inf/s** | 1,309 trn/s | **1.83 us** | **20 MB** |
+| **Julia** | 0.61 ms | **1.00 ms** | 4,205 inf/s | **1,558 trn/s** | 4.83 us | 488 MB |
+| **Go** | 1.14 ms | 3.33 ms | 2,121 inf/s | 867 trn/s | 5.67 us | 32 MB |
+| **Python** | 2.37 ms | 10.03 ms | 1,898 inf/s | 503 trn/s | 16.2 us | 63 MB |
 
-| Parameter | Value |
-|-----------|-------|
-| Hidden dim | 768 |
-| Layers | 30 |
-| Attention | MQA (12 Q heads, 1 KV head) |
-| Experts | 16 total, top-4 active |
-| FFN dim | 6144 |
-| Vocab size | 32,000 |
-| Context | 32K train → 256K inference (NTK) |
-| **Total params** | **~6.9B** |
-| **Active params** | **~1.8B** |
+Rust leads inference and kernels. Julia leads training. Both hit >37% of M1 AMX peak on matmul. At hidden=256, the forward gap already narrows from 4.2x to 1.9x.
 
-## Project Structure
+<details>
+<summary>Parallel scaling detail</summary>
 
-```
-machine_learning/
-├── rust/             # Rust implementation
-│   ├── nn-core/      # Model, tensor ops, training
-│   ├── nn-cuda/      # CUDA FFI bindings
-│   └── nn-ffi/       # FFI bridge + GpuTrainer
-├── go/               # Go implementation
-│   ├── tensor/       # Tensor operations
-│   ├── cuda/         # cgo CUDA bindings
-│   ├── layer/        # Neural network layers
-│   ├── model/        # MoE Transformer model
-│   └── train/        # Training pipeline
-├── python/           # Python implementation
-│   ├── nn/           # Neural network module
-│   ├── cuda/         # ctypes CUDA bindings
-│   └── tests/        # pytest tests
-├── cuda/             # Shared CUDA kernels (.cu, stub.c)
-├── benchmarks/       # Cross-language benchmarks
-│   ├── rust/         # Criterion benchmarks
-│   ├── go/           # testing.B benchmarks
-│   └── python/       # timeit + NumPy benchmarks
-├── docs-jp/          # 日本語ドキュメント
-├── docs-en/          # English documentation
-└── Cargo.toml        # Rust workspace
-```
+### Inference (T4/T1)
 
-## Language Implementations
+| | Julia | Rust | Go | Python |
+|---|---|---|---|---|
+| T1 | 1,458 inf/s | **1,742** | 874 | 768 |
+| T4 | 4,205 inf/s | **4,738** | 2,121 | 1,898 |
+| Speedup | **2.88x** | 2.72x | 2.43x | 2.47x |
 
-### Rust (rust/)
+### Training (T4/T1)
 
-Pure Rust implementation with `#![forbid(unsafe_code)]` in nn-core.
+| | Julia | Rust | Go | Python |
+|---|---|---|---|---|
+| T1 | **943 trn/s** | 758 | 311 | 175 |
+| T4 | **1,558 trn/s** | 1,309 | 867 | 503 |
+| Speedup | 1.65x | 1.73x | 2.79x | **2.88x** |
 
-- **nn-core**: Tensor ops, layers, attention, MoE, training
-- **nn-ffi**: FFI bridge, GpuTensor, GpuTrainer, CUDA Graph
+Training scaling is lower because backward pass triples AMX bus transactions. [Full AMX analysis](docs/analysis-parallel-training.md)
 
-### Go (go/)
+</details>
 
-Go implementation with cgo bindings to shared CUDA kernels.
-
-- **tensor**: Shape, DType, Tensor operations
-- **layer**: Embedding, RMSNorm, Linear, SwiGLU
-- **model**: MQAttention, Router, MoELayer, TransformerBlock, MoETransformer
-- **train**: AdamW optimizer, LR scheduler, training loop
-
-### Python (python/)
-
-Python implementation with numpy backend and ctypes CUDA bindings.
-
-- **nn.tensor**: Tensor operations (numpy backend)
-- **nn.layers**: Embedding, RMSNorm, Linear, SwiGLU
-- **nn.model**: MQAttention, Router, MoELayer, TransformerBlock, MoETransformer
-- **nn.train**: AdamW optimizer, LR scheduler, training loop
-- **cuda**: ctypes bindings with CPU fallback
-
-### CUDA Kernels (cuda/)
-
-Shared CUDA kernels used by both Rust and Go.
-
-| File | Kernels |
-|------|---------|
-| elementwise.cu | silu, add, mul, scale |
-| softmax.cu | softmax, top-k |
-| rmsnorm.cu | rmsnorm, fused residual |
-| gemm.cu | tiled GEMM (32×32), batched |
-| rope.cu | NTK RoPE frequencies |
-| attention.cu | MQA, FlashAttention-style |
-| loss.cu | CrossEntropy, AuxLoss |
-| optimizer.cu | AdamW, grad clip, scatter_add |
-| decode.cu | argmax, sample, top-k, top-p |
-
-**GPU Support**: sm_70 (V100), sm_75 (Turing), sm_80 (A100), sm_86 (Ampere), sm_89 (Ada), sm_90 (Hopper)
+Full results with 22 scenarios across 5 axes: [`docs/bench-results.md`](docs/bench-results.md)
 
 ## Quick Start
 
-### Rust
+```bash
+make test          # test all 4 languages
+make bench         # benchmark + summary table
+make convergence   # verify loss convergence
+```
+
+<details>
+<summary>Per-language commands & setup</summary>
 
 ```bash
-# Build
-cargo build --release
+make test-rust / make test-go / make test-python / make test-julia
+make bench-rust / make bench-julia
 
-# Test (53 tests)
-cargo test
-
-# Clippy
-cargo clippy --all-targets
+# First-time setup
+cd python && pip install -e ".[dev]" && cd ..
+cd julia && julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ..
 ```
 
-### Go
+</details>
 
-```bash
-cd go
+## Why This Exists
 
-# Test
-go test ./...
+| Question | Finding |
+|----------|---------|
+| **Is GC actually a problem for ML?** | No. Go: 29M alloc/train, gc_throughput 0.996. Julia: 0 GC pauses. |
+| **Does BLAS FFI overhead matter?** | Rust/Julia both >37% M1 peak. Language only matters for non-BLAS code. |
+| **Rust vs Julia for ML?** | Rust leads inference (0.57ms). Julia leads training (1.00ms via broadcast fusion). |
+| **Does column-major help?** | Yes for training. No for inference (Rust's optimization overcomes layout disadvantage). |
+| **Do language gaps persist at scale?** | Forward spread: 4.2x (h=64) → 1.9x (h=256). At h=1024+, gaps collapse to <5%. |
 
-# Build (requires CUDA library)
-go build ./...
+## What Makes This Different
+
+| | This repo | Benchmarks Game | ML framework benchmarks | Blog "X vs Y" posts |
+|---|---|---|---|---|
+| Workload | Full MoE Transformer (fwd + bwd + opt) | Toy algorithms | Framework-level API | Cherry-picked microbenchmarks |
+| BLAS control | All languages share same BLAS (Apple Accelerate) | N/A | Each framework bundles own BLAS | Uncontrolled |
+| GC analysis | `gc_throughput`, pause count, per-scenario instrumentation | None | None | "Rust has no GC" (hand-wave) |
+| Methodology | 5 axes, 22 scenarios, N=10 median, literature-backed metrics | Single metric | Wall time only | Single run |
+| Parallel model | std::thread / goroutine / ProcessPool / Threads.@threads | Varies | Framework-managed | Rarely tested |
+| Reproducibility | Fixed seed, fixed input, getrusage, JSON output | Varies | Docker-dependent | Not reproducible |
+| Math traceability | 21-entry equation-to-code map per language | None | None | None |
+
+## 5 Research Axes
+
+| Axis | What it isolates | Key finding |
+|------|-----------------|-------------|
+| **Memory** | Ownership vs GC vs RC under scaling | Rust 20MB/0.57ms fwd. Julia 0 GC forward + training (0 pauses, 0ns). Go 29M alloc/train, invisible GC (0.996) |
+| **Compiler** | BLAS dispatch + loop optimization | Rust/Julia both >37% M1 peak. Rust leads softmax (1.83us) and rmsnorm (3.38us) |
+| **Type System** | Dispatch overhead | Rust 0.57ms warm, Julia 0.61ms. Rust leads forward, Julia leads training |
+| **Parallel** | Thread scaling (inference + training) | Rust leads inference T4 (4,738 inf/s). Julia leads training T4 (1,558 trn/s). Training scaling limited by AMX contention |
+| **Scale** | Convergence at larger model | Forward spread: 4.2x (h=64) → 1.9x (h=256) |
+
+## Architecture
+
+All 4 implementations share the same model contract:
+
+```
+Input token_ids [batch, seq]
+  → Embedding lookup                    [batch, seq, hidden]
+  → N × TransformerBlock:
+      RMSNorm → MQ Attention (RoPE)   → Residual add
+      RMSNorm → MoE (Router + SwiGLU) → Residual add
+  → Final RMSNorm
+  → Linear (LM head)                   [batch, seq, vocab]
 ```
 
-### Python
+### Model Specification (benchmark config)
 
-```bash
-cd python
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| hidden_dim | 64 | Intentionally small to expose language overhead vs compute |
+| n_layers | 2 | Transformer blocks |
+| n_heads | 4 | Multi-Query Attention (1 KV head) |
+| head_dim | 16 | hidden / n_heads |
+| n_experts | 4 | Mixture-of-Experts per block |
+| top_k | 2 | Active experts per token |
+| intermediate_dim | 128 | SwiGLU hidden (2 × hidden) |
+| vocab_size | 1000 | Embedding table rows |
+| RoPE base | 10000 | With NTK-aware scaling |
+| Total params | ~0.1MB | Tiny model — overhead dominates, not compute |
 
-# Install
-pip install -e ".[dev]"
+## Equation-to-Code Traceability
 
-# Test (42 tests)
-pytest
+Every math formula in the model is mapped to concrete source code:
+
+| Category | Equations |
+|----------|-----------|
+| Core layers | Embedding, RMSNorm, Linear, SwiGLU, Softmax, SiLU |
+| Attention | RoPE rotation, Q@K^T/√d attention scores, causal masking |
+| MoE | Router gating (softmax + top-k), weighted expert combine, auxiliary load-balancing loss |
+| Training | Cross-entropy loss + gradient, AdamW (bias-corrected moments), gradient clipping, LR schedule (warmup + cosine) |
+| Inference | Temperature sampling, top-p (nucleus) sampling |
+
+All source files are annotated with inline comments mapping math notation to code. See each language's README for the full table.
+
+## Technology Stack
+
+| Language | BLAS Integration | Non-BLAS Optimization | Parallelism |
+|----------|-----------------|----------------------|-------------|
+| **Rust** | Direct FFI (`extern "C"` → Accelerate) | NEON SIMD rsqrt (`std::arch::aarch64`) | `std::thread::scope` |
+| **Go** | CGO bridge (`#cgo LDFLAGS: -framework Accelerate`) | Go compiler (no SIMD) | goroutine + `sync.WaitGroup` |
+| **Python** | NumPy → Accelerate (automatic on macOS ≥ 14) | NumPy vectorization | `ProcessPoolExecutor` |
+| **Julia** | `LinearAlgebra.mul!` via LBT → `AppleAccelerate.jl` | `@fastmath` approximate SIMD | `Threads.@threads` |
+
+All matrix multiplications route through Apple Accelerate's `cblas_sgemm`, which uses the AMX coprocessor on Apple Silicon. Non-matmul operations (softmax, RMSNorm, attention masking, MoE routing, AdamW optimizer) are hand-written loops — these are where language differences show up most.
+
+## Key Findings
+
+1. **BLAS levels the playing field.** All 4 languages hit the same AMX — the language only matters for non-BLAS code.
+2. **GC is not the enemy.** Go gc_throughput 0.985-1.000 across all scenarios. Julia: zero GC pauses on training.
+3. **Broadcast fusion > zero-alloc.** Julia's `@.` fused backward (1.00ms) beats Rust's hand-written zero-alloc backward (1.31ms).
+4. **AMX contention is the parallel ceiling.** Inference T4/T1: 2.4-2.9x. Training T4/T1: 1.7x (3x more AMX bus transactions).
+5. **Language gaps collapse at scale.** Forward spread: 4.2x (h=64) → 1.9x (h=256) → <5% (h=1024+, projected).
+6. **RSS inversely correlates with ergonomics.** Rust 20MB (manual everything) → Julia 488MB (JIT buys dispatch + fusion + zero-GC).
+
+## Why Julia Beats Rust at Training
+
+Rust leads forward (0.56ms vs 0.59ms) — but Julia leads training (0.98ms vs 1.44ms). The reversal comes from **backward pass implementation**.
+
+```
+Before: Julia 7.36ms (Rust was already ~1.4ms — Rust winning by 5x)
+After:  Julia 0.98ms (Rust 1.44ms — Julia winning by 1.5x)
 ```
 
-### CUDA (Optional)
+The fix was one pattern change — `@simd` → `@.` broadcast:
 
-CUDA is auto-detected. Without CUDA toolkit, CPU stubs are linked.
+```julia
+# Before: @simd — 9K-11K heap allocations per loop (Julia 1.12 SIMD lane metadata)
+@inbounds @simd for i in eachindex(grad)
+    grad[i] = grad[i] * mask[i]
+end
 
-```bash
-# Force CPU-only (Rust)
-CUDA_PATH="" cargo build --release
+# After: @. broadcast — compiler fuses into single loop, zero intermediate allocation
+@. grad = grad * mask
 ```
 
-## Usage
+| Metric | Before (`@simd`) | After (`@.`) | Change |
+|--------|-----------------|-------------|--------|
+| Train alloc | 55.5 MB/step | 3.0 MB/step | **-94%** |
+| Train time | 7.36 ms | 0.98 ms | **-87%** |
+| Fwd:Bwd ratio | 12:1 | 1.7:1 | -- |
+| GC pauses | >0 | **0** | -- |
 
-### Rust
+**Why Rust can't match this.** Rust's backward is zero-alloc (1.4 MB/step) — every gradient buffer is pre-allocated. But without broadcast fusion, each element-wise operation runs as a separate loop. Julia's compiler fuses `grad = grad * mask * scale + bias` into a single pass over memory. Rust would need a hand-written fused kernel for each combination — possible, but trades developer velocity for performance.
 
-```rust
-// Create tiny model for testing
-let model = MoETransformer::tiny();
+**The insight:** Zero allocation is not the same as zero overhead. Julia's broadcast fusion eliminates not just allocations but also loop overhead, cache misses from multiple passes, and function call boundaries. This is why a GC language beats a zero-GC language on training — the compiler does work that the programmer can't practically do by hand for every operation combination.
 
-// Forward pass
-let token_ids = vec![1, 2, 3, 4];
-let logits = model.forward_ids(&token_ids, 1, 4);
-// → [1, 4, vocab_size] logits
+Rust still leads inference (no backward pass), all non-BLAS kernels (softmax 1.83us vs 4.83us), and memory footprint (20MB vs 523MB).
+
+## When to Choose What
+
+| Use Case | Recommended | Rationale |
+|----------|-------------|-----------|
+| Production inference (latency) | Rust | 0.57ms forward, fastest single-thread inference |
+| Training pipeline | Julia | 1.00ms/step, optimized backward with zero GC |
+| Concurrent inference | Rust | 4,738 inf/s at T4, best absolute throughput |
+| Research prototyping | Python | PyTorch/JAX ecosystem, fastest time-to-experiment |
+| Scientific computing (BLAS-heavy) | Julia | Column-major BLAS alignment, 1.00ms train, best scaling ratio |
+| Edge / embedded / WASM | Rust | 20MB RSS, no runtime, `no_std` possible |
+| Microservice / API backend | Go | Simple deploy, invisible GC, fast compilation |
+| Maximum kernel throughput | Rust | softmax 1.83us — tightest scalar loops |
+| Correctness-critical numerics | Rust | IEEE 754 by default, each approximation auditable |
+| Rapid numerical experimentation | Julia | Column-major + REPL + JIT = iterate fast |
+| Minimum memory footprint | Rust | 20MB RSS, no runtime overhead |
+
+<details>
+<summary>Per-language profiles</summary>
+
+### Rust — Precision by Default, Speed by Choice
+
+| Metric | Value | Rank |
+|--------|-------|------|
+| Forward | **0.57ms** | **1st** |
+| Train | 1.31ms | 2nd |
+| softmax | **1.83us** | **1st** |
+| rmsnorm | **3.38us** | **1st** |
+| RSS | **20MB** | **1st** |
+
+**Strengths**: Leads forward (0.57ms), parallel T4 (4,738 inf/s), and all non-BLAS kernels. Lowest RSS (no runtime/GC/JIT). Zero GC by construction.
+
+**Weakness**: Training 1.31ms — 31% behind Julia (1.00ms) after Julia backward optimization.
+
+### Julia — JIT Compilation as Investment
+
+| Metric | Value | Rank |
+|--------|-------|------|
+| Forward | 0.61ms | 2nd |
+| Train | **1.00ms** | **1st** |
+| T4 throughput | 4,205 inf/s | 2nd |
+| GC pauses | 0 (forward + training) | 1st |
+| RSS | 488MB | 4th |
+
+**Strengths**: Fastest training (1.00ms). Column-major BLAS alignment + JIT specialization. Zero GC on both forward and training. Backward optimized via `@.` broadcast replacing `@simd` loops — train alloc dropped 7.2x. Best parallel scaling ratio at T4 (2.88x).
+
+**Weakness**: ~488MB RSS (JIT runtime + LLVM + method cache). True cold start ~300ms+.
+
+### Go — Simplicity as Competitive Advantage
+
+| Metric | Value | Rank |
+|--------|-------|------|
+| Forward | 1.14ms | 3rd |
+| GC throughput | 0.985-0.996 | Best among GC langs |
+| RSS | 32MB | 2nd |
+| Compilation | ~1s | Fastest |
+
+**Strengths**: GC is invisible (minimal overhead under 29M alloc/fwd). Simple parallelism (goroutine + WaitGroup). Lean runtime. Fastest compilation.
+
+**Weakness**: 3rd on most compute metrics. Go compiler lacks LLVM-level optimization and SIMD. CGO bridge ~1us per BLAS call.
+
+### Python — Ecosystem Over Execution
+
+| Metric | Value | Rank |
+|--------|-------|------|
+| Forward | 2.37ms | 4th |
+| T4 throughput | 1,898 inf/s | 4th |
+| Ecosystem | Unmatched | — |
+
+**Strengths**: NumPy → Accelerate with zero FFI effort. ProcessPoolExecutor provides reasonable parallel scaling. Ecosystem (PyTorch/JAX/HuggingFace) for production.
+
+**Weakness**: CPython interpreter 8-10x slower than Rust on non-BLAS code. ~2ms fixed overhead per call.
+
+</details>
+
+<details>
+<summary>Optimization Journey</summary>
+
+| Language | Before | After | Speedup | Key optimization |
+|----------|--------|-------|---------|-----------------|
+| **Julia forward** | 231 ms | **0.61 ms** | **379x** | Type stability (function barriers), column-major stride fix, router alloc elimination |
+| **Julia backward** | 7.36 ms train | **1.00 ms** train | **7.4x** | `@.` broadcast replacing `@simd` loops (Julia 1.12 `@simd` = 9K-11K micro-alloc/loop). Train alloc: 21.5M → 3.0M (7.2x) |
+| **Python T4** | 26 inf/s | **1,898 inf/s** | **73x** | ProcessPoolExecutor pre-created pool + initializer (was measuring fork overhead) |
+| **Rust forward** | 1.43 ms | **0.57 ms** | **2.5x** | Per-token → batched expert dispatch, `silu_in_place`, `add_in_place`, inference mode |
+
+</details>
+
+## Scaling Projection
+
+| Scale | Forward Spread | Train Spread | Status |
+|-------|---------------|-------------|--------|
+| hidden=64 | **4.2×** | **10.0×** | Measured |
+| hidden=256 | **1.9×** | **5.2×** | Measured |
+| hidden=1024 | ~1.2× | ~2.6× | Projected |
+| hidden=4096 | ~1.05× | ~1.3× | Projected |
+
+At production scale, BLAS dominates >90% of compute. Language choice becomes irrelevant for forward pass — what matters is GPU access, ecosystem, and developer velocity.
+
+<details>
+<summary>Measured h=256 data</summary>
+
+| Language | Forward h=64 | Forward h=256 | Train h=64 | Train h=256 |
+|----------|-------------|--------------|-----------|------------|
+| **Rust** | 0.56 ms | 2.91 ms | 1.44 ms | 16.90 ms |
+| **Julia** | 0.59 ms | 3.47 ms | 0.98 ms | 9.58 ms |
+| **Go** | 1.14 ms | 5.26 ms | 3.28 ms | 38.33 ms |
+| **Python** | 2.53 ms | 5.11 ms | 10.22 ms | 49.07 ms |
+
+</details>
+
+## Loss Convergence
+
+| Language | Initial Loss | Final Loss | Reduction |
+|----------|-------------|------------|-----------|
+| **Julia** | 7.25 | **0.021** | **-99.7%** |
+| **Go** | 8.47 | **0.022** | **-99.7%** |
+| **Python** | 7.34 | **0.023** | **-99.7%** |
+| **Rust** | 7.82 | **0.024** | **-99.7%** |
+
+All 4 implementations converge to ~0.02 (from ~7.5), confirming gradient correctness. Run `make convergence` to verify.
+
+## Verification Environment
+
+| Item | Value |
+|------|-------|
+| Hardware | MacBook Air M1 (8-core: 4 perf + 4 eff, 16GB unified memory) |
+| OS | macOS (Darwin 25.2.0) |
+| Rust | rustc 1.91.1 (2024 Edition) |
+| Go | go1.25.6 |
+| Python | 3.13.5 + NumPy (Accelerate-linked) |
+| Julia | 1.12.4 + AppleAccelerate.jl |
+| BLAS | Apple Accelerate (AMX, ~1.49 TFLOPS f32 theoretical peak) |
+| Methodology | N=10 trials, 3 warmup, median reported, fixed seed (42) |
+
+## Known Limitations
+
+- **Small model size**: hidden=64 amplifies per-call overhead. At production sizes (hidden=4096+), BLAS would dominate and language differences would shrink (see [Scaling Projection](#scaling-projection) above).
+- **Single hardware**: Apple M1 only. Results may differ on x86 (no AMX), NVIDIA GPU, or different Apple Silicon generations.
+- **CPU only**: No GPU benchmarks. At scale, GPU compute (A100: ~312 TFLOPS f32) dwarfs CPU (~1.5 TFLOPS).
+- **alloc_bytes not comparable**: Each language measures allocation differently. Use `peak_rss_bytes` for cross-language comparison.
+
+## Project Structure
+
+```text
+machine_learning/
+├── rust/                 # Rust: LLVM AOT + NEON SIMD + Accelerate FFI
+│   └── src/bin/convergence.rs  # Loss convergence verification (Rust)
+├── go/                   # Go: CGO Accelerate bridge + goroutines
+│   └── nn_test.go              # TestConvergence (Go convergence verification)
+├── python/               # Python: NumPy → Accelerate + ProcessPoolExecutor
+├── julia/                # Julia: LBT → AppleAccelerate.jl + @fastmath SIMD
+├── benchmarks/           # Raw JSON outputs (4 languages)
+├── scripts/
+│   ├── summary.py                # Benchmark summary table generator
+│   ├── convergence_python.py     # Loss convergence verification (Python)
+│   └── convergence_julia.jl      # Loss convergence verification (Julia)
+├── docs/
+│   ├── spec.md           # Spec: requirements, evaluation matrix, acceptance criteria
+│   ├── bench-results.md  # Results: methodology, 5-axis data, per-language deep analysis
+│   └── analysis-parallel-training.md  # AMX architecture analysis of parallel training scaling
+├── Makefile              # make test / make bench / make convergence / make verify
+└── Cargo.toml
 ```
 
-### Go
-
-```go
-// Create tiny model for testing
-model := model.NewTiny()
-
-// Forward pass
-tokenIDs := []int{1, 2, 3, 4}
-logits := model.ForwardIDs(tokenIDs, 1, 4)
-// → [1, 4, vocab_size] logits
-```
-
-### Python
-
-```python
-from nn import MoETransformer
-
-# Create tiny model for testing
-model = MoETransformer.tiny()
-
-# Forward pass
-token_ids = [1, 2, 3, 4]
-logits = model.forward_ids(token_ids, batch=1, seq_len=4)
-# → [1, 4, vocab_size] logits
-```
-
-## Implementation Status
-
-| Component | Rust | Go | Python |
-|-----------|------|-----|--------|
-| Tensor ops | ✅ | ✅ | ✅ |
-| Embedding | ✅ | ✅ | ✅ |
-| RMSNorm | ✅ | ✅ | ✅ |
-| Linear | ✅ | ✅ | ✅ |
-| MQA Attention | ✅ | ✅ | ✅ |
-| MoE Router | ✅ | ✅ | ✅ |
-| Expert FFN | ✅ | ✅ | ✅ |
-| Full model forward | ✅ | ✅ | ✅ |
-| CUDA bindings | ✅ FFI | ✅ cgo | ✅ ctypes |
-| Training loop | ✅ | ✅ | ✅ |
-| GPU decode | ✅ | ✅ | ✅ |
-| GpuTrainer | ✅ | - | - |
-
-## Benchmarks
-
-Cross-language performance comparison using naive implementations (no BLAS/SIMD optimization).
-
-### Results (Apple M-series, single thread)
-
-#### Matrix Multiplication (512×512)
-| Language | Time | Relative |
-|----------|------|----------|
-| Python (NumPy/BLAS) | 215 µs | 1x |
-| Rust (naive) | 125 ms | 581x |
-| Go (naive) | 150 ms | 698x |
-
-#### Softmax (512×32000)
-| Language | Time | Relative |
-|----------|------|----------|
-| Rust | 35.1 ms | 1x |
-| Python (NumPy) | 37.0 ms | 1.05x |
-| Go | 160 ms | 4.6x |
-
-#### SiLU (65536 elements)
-| Language | Time | Relative |
-|----------|------|----------|
-| Rust | 126 µs | 1x |
-| Python (NumPy) | 138 µs | 1.09x |
-| Go | 462 µs | 3.7x |
-
-#### RMSNorm (512×768)
-| Language | Time | Relative |
-|----------|------|----------|
-| Python (NumPy) | 226 µs | 1x |
-| Rust | 441 µs | 1.95x |
-| Go | 751 µs | 3.3x |
-
-### Key Insights
-
-| Factor | Impact |
-|--------|--------|
-| Language overhead (Rust vs Go) | ~2-5x |
-| BLAS vs naive | ~500x |
-| SIMD vectorization | ~4-8x |
-| Cache blocking | ~10-100x |
-
-**Conclusion**: Algorithm and library choice (BLAS, SIMD) dominate performance. Language selection matters less than optimization strategy. In production, all three languages achieve similar performance when using optimized backends (NumPy/BLAS, ndarray/BLAS, gonum/BLAS).
-
-```bash
-# Run benchmarks
-cd benchmarks
-./run_all.sh              # All languages
-./run_all.sh --rust-only  # Rust only
-./run_all.sh --go-only    # Go only
-./run_all.sh --python-only # Python only
-```
-
-## Design Principles
-
-- **Type safety**: `#![forbid(unsafe_code)]` in Rust nn-core
-- **Shared CUDA**: Single CUDA kernel source for all languages
-- **Multi-language**: Rust (FFI) + Go (cgo) + Python (ctypes)
-- **Manual autograd**: Educational, full control
-- **MQA**: Memory efficient (1 KV head)
-- **NTK RoPE**: 32K→256K extrapolation
-- **GPU-resident**: Minimal CPU↔GPU transfer (loss only)
-
-## Docs
-
-**日本語 / Japanese**
-- [docs-jp/00-index.md](docs-jp/00-index.md) - ドキュメント索引
-- [docs-jp/1-model.md](docs-jp/1-model.md) - モデルアーキテクチャ
-- [docs-jp/2-learn.md](docs-jp/2-learn.md) - 学習システム
-
-**English**
-- [docs-en/00-index.md](docs-en/00-index.md) - Documentation index
-- [docs-en/1-model.md](docs-en/1-model.md) - Model architecture
-- [docs-en/2-learn.md](docs-en/2-learn.md) - Training system
+Each language directory contains its own README with architecture overview, 21-entry equation-to-code map, implementation notes, performance characteristics, and gotchas.
 
 ## License
 
-Licensed under either of:
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-at your option.
+Licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See [LICENSE](LICENSE) for details.

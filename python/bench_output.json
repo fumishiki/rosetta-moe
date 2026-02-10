@@ -1,0 +1,1107 @@
+{
+  "metadata": {
+    "language": "python",
+    "language_version": "3.13.5",
+    "os": "Darwin 25.2.0",
+    "cpu_model": "arm",
+    "timestamp": "2026-02-08T18:10:38.391680+00:00",
+    "seed": 42,
+    "n_trials": 10,
+    "n_warmup": 3
+  },
+  "scenarios": [
+    {
+      "timings_ns": [
+        7213500,
+        7184209,
+        6825208,
+        6856000,
+        6786250,
+        6466625,
+        6411458,
+        6681333,
+        6610208,
+        6852333
+      ],
+      "cpu_times_ns": [
+        7226000,
+        7192000,
+        6831000,
+        6862000,
+        6791999,
+        6471000,
+        6417000,
+        6682000,
+        6609000,
+        6851999
+      ],
+      "warmup_timings_ns": [
+        4271875,
+        3492917,
+        3924625
+      ],
+      "median_ns": 6805729,
+      "p95_ns": 7200319,
+      "min_ns": 6411458,
+      "max_ns": 7213500,
+      "iqr_ns": 227094,
+      "cpu_median_ns": 6811499,
+      "memory": {
+        "peak_rss_bytes": 51757056,
+        "alloc_bytes": 4661104
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 0.0
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 684879459,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_train_step",
+      "axis": "memory",
+      "params": {
+        "batch": 2,
+        "seq_len": 8,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 2350.960492255863
+    },
+    {
+      "timings_ns": [
+        2471709,
+        2287750,
+        2380459,
+        2274333,
+        2276834,
+        2288791,
+        2264375,
+        2252458,
+        2252375,
+        2316209
+      ],
+      "cpu_times_ns": [
+        2479000,
+        2291999,
+        2385000,
+        2278999,
+        2281000,
+        2292999,
+        2270000,
+        2257000,
+        2256999,
+        2322000
+      ],
+      "warmup_timings_ns": [
+        1175125,
+        964250,
+        904292
+      ],
+      "median_ns": 2282292,
+      "p95_ns": 2430646,
+      "min_ns": 2252375,
+      "max_ns": 2471709,
+      "iqr_ns": 42490,
+      "cpu_median_ns": 2286499,
+      "memory": {
+        "peak_rss_bytes": 52772864,
+        "alloc_bytes": 745736
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 5.756736755371094
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 326748724,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_batch_1",
+      "axis": "memory",
+      "params": {
+        "batch": 1,
+        "seq_len": 32,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 14020.992931666939
+    },
+    {
+      "timings_ns": [
+        3062084,
+        2902500,
+        2647458,
+        2618084,
+        2620750,
+        2580792,
+        2624000,
+        2630417,
+        2586750,
+        2879625
+      ],
+      "cpu_times_ns": [
+        3070999,
+        2907999,
+        2651000,
+        2622999,
+        2624999,
+        2585999,
+        2628000,
+        2634999,
+        2591000,
+        2877000
+      ],
+      "warmup_timings_ns": [
+        1618709,
+        1332541,
+        1307334
+      ],
+      "median_ns": 2627208,
+      "p95_ns": 2990271,
+      "min_ns": 2580792,
+      "max_ns": 3062084,
+      "iqr_ns": 202833,
+      "cpu_median_ns": 2631499,
+      "memory": {
+        "peak_rss_bytes": 53362688,
+        "alloc_bytes": 1459304
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 5.88121223449707
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 555458113,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_batch_2",
+      "axis": "memory",
+      "params": {
+        "batch": 2,
+        "seq_len": 32,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 24360.46175255252
+    },
+    {
+      "timings_ns": [
+        3556833,
+        3373625,
+        3360333,
+        3380917,
+        3350292,
+        3358375,
+        3575375,
+        3523500,
+        3401541,
+        3380209
+      ],
+      "cpu_times_ns": [
+        3565000,
+        3378000,
+        3364000,
+        3386000,
+        3354999,
+        3363000,
+        3578000,
+        3527999,
+        3405999,
+        3383999
+      ],
+      "warmup_timings_ns": [
+        2022459,
+        1873875,
+        1700167
+      ],
+      "median_ns": 3380563,
+      "p95_ns": 3567031,
+      "min_ns": 3350292,
+      "max_ns": 3575375,
+      "iqr_ns": 129354,
+      "cpu_median_ns": 3384999,
+      "memory": {
+        "peak_rss_bytes": 53886976,
+        "alloc_bytes": 2900904
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 5.934787750244141
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 858112687,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_batch_4",
+      "axis": "memory",
+      "params": {
+        "batch": 4,
+        "seq_len": 32,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 37863.51563334273
+    },
+    {
+      "timings_ns": [
+        5336958,
+        5610416,
+        5285834,
+        5441041,
+        5518042,
+        5385000,
+        5496666,
+        5334792,
+        5074333,
+        4872250
+      ],
+      "cpu_times_ns": [
+        5344999,
+        5606000,
+        5290999,
+        5429000,
+        5492999,
+        5391000,
+        5498000,
+        5340000,
+        5079000,
+        4875999
+      ],
+      "warmup_timings_ns": [
+        3067458,
+        2735042,
+        2799083
+      ],
+      "median_ns": 5360979,
+      "p95_ns": 5568847,
+      "min_ns": 4872250,
+      "max_ns": 5610416,
+      "iqr_ns": 184686,
+      "cpu_median_ns": 5367999,
+      "memory": {
+        "peak_rss_bytes": 56721408,
+        "alloc_bytes": 5769608
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 6.911453723907471
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 1076222831,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_batch_8",
+      "axis": "memory",
+      "params": {
+        "batch": 8,
+        "seq_len": 32,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 47752.47207646215
+    },
+    {
+      "timings_ns": [
+        2262291,
+        2119958,
+        2084833,
+        2297042,
+        2225292,
+        2144584,
+        2141833,
+        2107000,
+        2108125,
+        2164333
+      ],
+      "cpu_times_ns": [
+        2272999,
+        2124999,
+        2089000,
+        2294999,
+        2229999,
+        2149999,
+        2146000,
+        2112000,
+        2112000,
+        2169000
+      ],
+      "warmup_timings_ns": [
+        971292,
+        765666,
+        743667
+      ],
+      "median_ns": 2143208,
+      "p95_ns": 2281404,
+      "min_ns": 2084833,
+      "max_ns": 2297042,
+      "iqr_ns": 98969,
+      "cpu_median_ns": 2147999,
+      "memory": {
+        "peak_rss_bytes": 56754176,
+        "alloc_bytes": 376504
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 6.288220405578613
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 175673103,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_seq_8",
+      "axis": "memory",
+      "params": {
+        "batch": 2,
+        "seq_len": 8,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 7465.444324582588
+    },
+    {
+      "timings_ns": [
+        2468875,
+        2287792,
+        2259125,
+        2256958,
+        2256584,
+        2309333,
+        2247750,
+        2248875,
+        2270875,
+        2620084
+      ],
+      "cpu_times_ns": [
+        2476000,
+        2293000,
+        2263000,
+        2262999,
+        2259999,
+        2313999,
+        2252999,
+        2253000,
+        2276999,
+        2619000
+      ],
+      "warmup_timings_ns": [
+        1189958,
+        934833,
+        893042
+      ],
+      "median_ns": 2265000,
+      "p95_ns": 2552039,
+      "min_ns": 2247750,
+      "max_ns": 2620084,
+      "iqr_ns": 47270,
+      "cpu_median_ns": 2269999,
+      "memory": {
+        "peak_rss_bytes": 56868864,
+        "alloc_bytes": 729180
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 6.074588298797607
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 321933774,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_seq_16",
+      "axis": "memory",
+      "params": {
+        "batch": 2,
+        "seq_len": 16,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 14128.0353200883
+    },
+    {
+      "timings_ns": [
+        2912500,
+        2659125,
+        2603791,
+        2611166,
+        2633416,
+        2613583,
+        2607000,
+        2747709,
+        2639667,
+        2611833
+      ],
+      "cpu_times_ns": [
+        2919999,
+        2662999,
+        2607999,
+        2613999,
+        2638000,
+        2618000,
+        2611999,
+        2751999,
+        2643999,
+        2615999
+      ],
+      "warmup_timings_ns": [
+        1342000,
+        1234500,
+        1271042
+      ],
+      "median_ns": 2623499,
+      "p95_ns": 2838344,
+      "min_ns": 2603791,
+      "max_ns": 2912500,
+      "iqr_ns": 42928,
+      "cpu_median_ns": 2628000,
+      "memory": {
+        "peak_rss_bytes": 56868864,
+        "alloc_bytes": 1459112
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 5.88121223449707
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 556170213,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_seq_32",
+      "axis": "memory",
+      "params": {
+        "batch": 2,
+        "seq_len": 32,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 24394.901618029966
+    },
+    {
+      "timings_ns": [
+        3869459,
+        4413708,
+        3623000,
+        3499041,
+        3473208,
+        3498125,
+        3467041,
+        3445292,
+        3455958,
+        3454292
+      ],
+      "cpu_times_ns": [
+        3871000,
+        4345000,
+        3627999,
+        3503000,
+        3479000,
+        3502999,
+        3471000,
+        3450999,
+        3460999,
+        3458000
+      ],
+      "warmup_timings_ns": [
+        2013000,
+        1863833,
+        1788083
+      ],
+      "median_ns": 3485666,
+      "p95_ns": 4168795,
+      "min_ns": 3445292,
+      "max_ns": 4413708,
+      "iqr_ns": 133282,
+      "cpu_median_ns": 3490999,
+      "memory": {
+        "peak_rss_bytes": 57032704,
+        "alloc_bytes": 3031800
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 6.243395805358887
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 869790737,
+        "gc_throughput": 1.0
+      },
+      "id": "mem_scale_seq_64",
+      "axis": "memory",
+      "params": {
+        "batch": 2,
+        "seq_len": 64,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 36721.82016291865
+    },
+    {
+      "timings_ns": [
+        12292,
+        3791,
+        3667,
+        2792,
+        3292,
+        3250,
+        2833,
+        3250,
+        3208,
+        2750
+      ],
+      "cpu_times_ns": [
+        21999,
+        9000,
+        9000,
+        6999,
+        6999,
+        8000,
+        5999,
+        7999,
+        8000,
+        6999
+      ],
+      "warmup_timings_ns": [
+        5583,
+        2458,
+        2000
+      ],
+      "median_ns": 3250,
+      "p95_ns": 8466,
+      "min_ns": 2750,
+      "max_ns": 12292,
+      "iqr_ns": 647,
+      "cpu_median_ns": 7999,
+      "memory": {
+        "peak_rss_bytes": 57032704,
+        "alloc_bytes": 2184
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 34.47032165527344
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 672000000,
+        "gc_throughput": 1.0,
+        "gflops": 161.31938461538462
+      },
+      "id": "kernel_matmul",
+      "axis": "compiler",
+      "params": {
+        "M": 64,
+        "K": 64,
+        "N": 64
+      },
+      "known_flops": 524288,
+      "warmup_runs": 3,
+      "trial_runs": 10
+    },
+    {
+      "timings_ns": [
+        47041,
+        19584,
+        17333,
+        17000,
+        16917,
+        16709,
+        16500,
+        18208,
+        17084,
+        16417
+      ],
+      "cpu_times_ns": [
+        53999,
+        24000,
+        21000,
+        21000,
+        20000,
+        21000,
+        20000,
+        21999,
+        21999,
+        20000
+      ],
+      "warmup_timings_ns": [
+        17541,
+        8250,
+        7375
+      ],
+      "median_ns": 17042,
+      "p95_ns": 34685,
+      "min_ns": 16417,
+      "max_ns": 47041,
+      "iqr_ns": 1228,
+      "cpu_median_ns": 21000,
+      "memory": {
+        "peak_rss_bytes": 57032704,
+        "alloc_bytes": 8776
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 0.028009653091430664
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 514963032,
+        "gc_throughput": 1.0,
+        "gflops": 0.2347142354183781
+      },
+      "id": "kernel_softmax",
+      "axis": "compiler",
+      "params": {
+        "n": 1000
+      },
+      "known_flops": 4000,
+      "warmup_runs": 3,
+      "trial_runs": 10
+    },
+    {
+      "timings_ns": [
+        41000,
+        26541,
+        23542,
+        23125,
+        22542,
+        22541,
+        22583,
+        22583,
+        22792,
+        22541
+      ],
+      "cpu_times_ns": [
+        49999,
+        29999,
+        26999,
+        26999,
+        25999,
+        26000,
+        26000,
+        25999,
+        26999,
+        25000
+      ],
+      "warmup_timings_ns": [
+        23542,
+        12375,
+        9875
+      ],
+      "median_ns": 22687,
+      "p95_ns": 34493,
+      "min_ns": 22541,
+      "max_ns": 41000,
+      "iqr_ns": 885,
+      "cpu_median_ns": 26499,
+      "memory": {
+        "peak_rss_bytes": 57032704,
+        "alloc_bytes": 18784
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 3.5829813480377197
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 827963150,
+        "gc_throughput": 1.0,
+        "gflops": 0.5416317714990964
+      },
+      "id": "kernel_rmsnorm",
+      "axis": "compiler",
+      "params": {
+        "shape": [
+          2,
+          32,
+          64
+        ]
+      },
+      "known_flops": 12288,
+      "warmup_runs": 3,
+      "trial_runs": 10
+    },
+    {
+      "timings_ns": [
+        2901708,
+        2637875,
+        2602542,
+        2790708,
+        2662250,
+        2597708,
+        2604375,
+        2597375,
+        2577000,
+        2605375
+      ],
+      "cpu_times_ns": [
+        2909000,
+        2641999,
+        2606000,
+        2796999,
+        2666000,
+        2600999,
+        2609000,
+        2600999,
+        2580999,
+        2608999
+      ],
+      "warmup_timings_ns": [
+        1406333,
+        1195292,
+        1178583
+      ],
+      "median_ns": 2604875,
+      "p95_ns": 2851758,
+      "min_ns": 2577000,
+      "max_ns": 2901708,
+      "iqr_ns": 57240,
+      "cpu_median_ns": 2608999,
+      "memory": {
+        "peak_rss_bytes": 57032704,
+        "alloc_bytes": 1458936
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 5.88121223449707
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 560079082,
+        "gc_throughput": 1.0
+      },
+      "id": "dispatch_warm",
+      "axis": "type_system",
+      "params": {
+        "batch": 2,
+        "seq_len": 32,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 24569.31714573636
+    },
+    {
+      "timings_ns": [
+        10921958,
+        11179125,
+        10747875,
+        10753208,
+        10896125,
+        10876334,
+        10732041,
+        10851792,
+        10703500,
+        10959375
+      ],
+      "cpu_times_ns": [
+        10932999,
+        11180999,
+        10751999,
+        10757000,
+        10896999,
+        10880999,
+        10735999,
+        10849999,
+        10708000,
+        10958999
+      ],
+      "warmup_timings_ns": [],
+      "median_ns": 10864063,
+      "p95_ns": 11080237,
+      "min_ns": 10703500,
+      "max_ns": 11179125,
+      "iqr_ns": 166291,
+      "cpu_median_ns": 10865499,
+      "memory": {
+        "peak_rss_bytes": 57163776,
+        "alloc_bytes": 49872
+      },
+      "gc": {
+        "total_gc_time_ns": 0,
+        "gc_pause_count": 0
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 4.97322940826416
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": 4590547,
+        "gc_throughput": 1.0
+      },
+      "id": "dispatch_cold",
+      "axis": "type_system",
+      "params": {
+        "batch": 1,
+        "seq_len": 8,
+        "hidden_dim": 64
+      },
+      "warmup_runs": 0,
+      "trial_runs": 10,
+      "throughput_tokens_per_sec": 736.372754833988
+    },
+    {
+      "id": "parallel_T1",
+      "axis": "parallel",
+      "params": {
+        "batch": 2,
+        "seq_len": 32,
+        "hidden_dim": 64,
+        "n_procs": 1
+      },
+      "parallel_semantics": "independent",
+      "timings_ns": [
+        117479708,
+        115952958,
+        119212667,
+        116140833,
+        119263750,
+        118800125,
+        117253958,
+        119489625,
+        116996458,
+        116191042
+      ],
+      "cpu_times_ns": [
+        2614000,
+        2687000,
+        2656999,
+        2950999,
+        2872999,
+        2861000,
+        2708000,
+        2923000,
+        2701999,
+        2765999
+      ],
+      "warmup_timings_ns": [
+        120458875,
+        117077125,
+        116790667
+      ],
+      "median_ns": 117366833,
+      "p95_ns": 119387981,
+      "min_ns": 115952958,
+      "max_ns": 119489625,
+      "iqr_ns": 2717135,
+      "cpu_median_ns": 2736999,
+      "throughput_tokens_per_sec": 545.2988579831577,
+      "memory": {
+        "peak_rss_bytes": 57901056,
+        "alloc_bytes": null
+      },
+      "gc": {
+        "total_gc_time_ns": null,
+        "gc_pause_count": null
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 0.0
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": null,
+        "gc_throughput": null
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10
+    },
+    {
+      "id": "parallel_T2",
+      "axis": "parallel",
+      "params": {
+        "batch": 2,
+        "seq_len": 32,
+        "hidden_dim": 64,
+        "n_procs": 2
+      },
+      "parallel_semantics": "independent",
+      "timings_ns": [
+        128577667,
+        128103542,
+        132020458,
+        127504000,
+        128086417,
+        128168750,
+        129249208,
+        128628333,
+        131055625,
+        136867084
+      ],
+      "cpu_times_ns": [
+        4449999,
+        4897999,
+        4346999,
+        4175999,
+        4330999,
+        4141999,
+        4677000,
+        4240000,
+        4345000,
+        4132000
+      ],
+      "warmup_timings_ns": [
+        128612917,
+        129680791,
+        128010458
+      ],
+      "median_ns": 128603000,
+      "p95_ns": 134686102,
+      "min_ns": 127504000,
+      "max_ns": 136867084,
+      "iqr_ns": 2484176,
+      "cpu_median_ns": 4337999,
+      "throughput_tokens_per_sec": 995.3111513728296,
+      "memory": {
+        "peak_rss_bytes": 57901056,
+        "alloc_bytes": null
+      },
+      "gc": {
+        "total_gc_time_ns": null,
+        "gc_pause_count": null
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 0.0
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": null,
+        "gc_throughput": null
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10
+    },
+    {
+      "id": "parallel_T4",
+      "axis": "parallel",
+      "params": {
+        "batch": 2,
+        "seq_len": 32,
+        "hidden_dim": 64,
+        "n_procs": 4
+      },
+      "parallel_semantics": "independent",
+      "timings_ns": [
+        152900958,
+        152495333,
+        152202166,
+        168043333,
+        148620459,
+        150450292,
+        147699875,
+        154069417,
+        150318167,
+        149986208
+      ],
+      "cpu_times_ns": [
+        8919000,
+        9288999,
+        8850999,
+        8764999,
+        7588000,
+        8252000,
+        7938000,
+        9062999,
+        8190999,
+        8584000
+      ],
+      "warmup_timings_ns": [
+        160771583,
+        148559375,
+        147037875
+      ],
+      "median_ns": 151326229,
+      "p95_ns": 161755070,
+      "min_ns": 147699875,
+      "max_ns": 168043333,
+      "iqr_ns": 2730354,
+      "cpu_median_ns": 8674499,
+      "throughput_tokens_per_sec": 1691.7093731318712,
+      "memory": {
+        "peak_rss_bytes": 57901056,
+        "alloc_bytes": null
+      },
+      "gc": {
+        "total_gc_time_ns": null,
+        "gc_pause_count": null
+      },
+      "numerical": {
+        "nan_count": 0,
+        "inf_count": 0,
+        "max_abs": 0.0
+      },
+      "derived": {
+        "alloc_rate_bytes_per_sec": null,
+        "gc_throughput": null
+      },
+      "warmup_runs": 3,
+      "trial_runs": 10
+    }
+  ]
+}

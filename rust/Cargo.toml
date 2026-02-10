@@ -1,0 +1,15 @@
+[package]
+name = "nn-core"
+version = "0.1.0"
+edition = "2024"
+description = "MoE Transformer core implementation"
+license = "CC-BY-4.0"
+
+autobenches = false
+
+[[bin]]
+name = "bench"
+path = "benches/bench.rs"
+
+[dependencies]
+libc = "0.2"
