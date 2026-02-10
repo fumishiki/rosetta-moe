@@ -520,24 +520,20 @@ This benchmark uses hidden=64 to expose language overhead. To verify that perfor
 
 **3. Rust leads forward at both scales.** Rust leads at h=64 (0.57ms) and h=256 (2.88ms). Julia at 1.22x (3.51ms) at h=256. The gap narrows at h=256 as BLAS fraction grows.
 
-**4. Julia training lead persists at scale.** Julia (9.46ms) leads Rust (16.91ms) at h=256 by 1.79x. The broadcast fusion advantage scales well — larger matrices mean more element-wise operations that benefit from fusion.
+**4. Julia training lead persists at scale.** Julia (9.46ms) leads Rust (16.91ms) at h=256 by 1.79x. This reflects Julia's **language-level fusion compilation**: the `@.` broadcast compiler fuses multiple element-wise operations into a single pass, eliminating intermediate allocations. This is not a CPU-specific trick — on GPU, the same capability manifests as [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (XLA backend) for automatic whole-graph kernel fusion. Rust has no equivalent automatic fusion; closing this gap would require hand-written CUDA kernels or framework support (e.g., Burn).
 
 **5. Python training slowest at scale** (49.18ms at h=256, 5.20x slowest). The CPython interpreter overhead compounds with backward pass complexity at larger model sizes.
 
 **6. Julia training growth highest** (9.5x for 4x hidden). This reflects Julia's efficient backward pass scaling — broadcast fusion handles larger tensors without proportional allocation increase.
 
-#### Projected Convergence
-
-Extrapolating from measured data:
+#### Measured Convergence Trend
 
 | Scale | Forward Spread | Train Spread | Status |
 |-------|---------------|-------------|--------|
 | hidden=64 | 4.16x | 10.03x | Measured |
 | hidden=256 | 1.90x | 5.20x | Measured |
-| hidden=1024 | ~1.2x | ~2.6x | Extrapolated |
-| hidden=4096 | ~1.05x | ~1.3x | Extrapolated |
 
-At hidden=1024+, BLAS consumes >90% of compute. All languages call the same `cblas_sgemm` → forward performance converges toward ~5%. Training convergence is slower due to backward pass implementation differences (broadcast fusion vs manual loops vs interpreter overhead).
+Forward spread halved (-54%) from h=64 to h=256 as BLAS share grows. Training convergence is slower due to backward pass implementation differences — Julia's language-level broadcast fusion vs Rust's manual loops vs Python's interpreter overhead.
 
 #### Per-Finding Scaling (Measured)
 
@@ -545,7 +541,7 @@ At hidden=1024+, BLAS consumes >90% of compute. All languages call the same `cbl
 
 **Training: Julia leads at both scales.** h=64: Julia 1.00ms. h=256: Julia 9.46ms. Julia's broadcast fusion advantage persists at scale (1.79x over Rust at h=256). Rust's zero-alloc backward is efficient but Julia's fused operations are faster overall.
 
-**RSS differences already irrelevant at h=256:** Model weights at hidden=256 total ~2MB. Julia's 488MB runtime is still 99%+ of RSS. But by hidden=1024 (~100MB weights), runtime overhead drops to ~80%. By hidden=4096 (~13GB), it's ~3%.
+**RSS differences already irrelevant at h=256:** Model weights at hidden=256 total ~2MB. Julia's 488MB runtime is still 99%+ of RSS. At larger hidden sizes, model weights grow and runtime overhead becomes a smaller fraction of total RSS.
 
 **FFI overhead amortized:** Go's CGO bridge overhead is significant at 64×64. At 256×256, sgemm takes longer, making CGO a smaller fraction. At 1024×1024, CGO becomes negligible relative to compute.
 
@@ -560,7 +556,9 @@ At hidden=1024+, BLAS consumes >90% of compute. All languages call the same `cbl
 
 #### Summary
 
-**Measured convergence confirms the projection: forward spread 4.16x → 1.90x at hidden=256 (-54%), training spread 10.03x → 5.20x (-48%).** The hidden=256 data point validates that language differences narrow as BLAS fraction grows. At production scale (hidden=1024+), forward performance converges to within ~5%, while training differences persist longer due to backward pass architecture choices.
+**Measured convergence: forward spread 4.16x → 1.90x at hidden=256 (-54%), training spread 10.03x → 5.20x (-48%).** Language differences narrow as BLAS fraction grows. Training differences persist longer due to backward pass architecture choices — Julia's language-level fusion compilation vs Rust's manual zero-alloc loops.
+
+**Note:** All measurements are on Apple M1 (AMX). On production GPUs, the overhead structure changes fundamentally: Rust's kernel launch overhead would match Julia's (both zero-GC, direct memory control), but Julia retains an architectural advantage through Reactant.jl (XLA-based automatic kernel fusion). Treat absolute numbers as M1-specific reference data.
 
 ---
 

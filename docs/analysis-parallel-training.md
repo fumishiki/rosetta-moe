@@ -151,7 +151,7 @@ end
 @. grad = grad * mask
 ```
 
-Julia の broadcast fusion はコンパイラが **element-wise 演算を単一ループに融合** し、中間配列を一切生成しない[^7]。結果:
+Julia の broadcast fusion は **言語レベルの融合コンパイル能力** である。コンパイラが element-wise 演算を単一ループに融合し、中間配列を一切生成しない[^7]。これは CPU 固有のトリックではなく、GPU では [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl)（XLA backend）として発現し、計算グラフ全体の自動カーネル融合を実現する。Rust には同等の自動融合機構がなく、GPU で同じ効果を得るには手動 CUDA カーネルか Burn 等のフレームワークが必要になる。結果:
 
 | Metric | Before (@simd) | After (@. broadcast) | Change |
 |--------|---------------|---------------------|--------|
@@ -224,7 +224,7 @@ $$S_{\text{Python}}(4) = \frac{1}{0.15 + 0.85/4} = 2.76\text{x}$$
 
 2. **Backward pass は forward の3倍のバス帯域を要求する。** これは GPU でも同じ。A100 の HBM2e 帯域 (2TB/s) が学習で先にボトルネックになる理由の一つ
 
-3. **演算融合 (kernel fusion) の価値は並列環境で増大する。** Julia の broadcast fusion が学習で優位な理由は、AMX バストランザクションの間に挟まる non-AMX 演算を最小化し、バスの利用効率を上げているから。GPU での FlashAttention や XLA の演算融合と同じ原理
+3. **演算融合 (kernel fusion) の価値は並列環境で増大する。** Julia の broadcast fusion が学習で優位な理由は、AMX バストランザクションの間に挟まる non-AMX 演算を最小化し、バスの利用効率を上げているから。GPU での FlashAttention や XLA の演算融合と同じ原理。Julia の場合、この融合能力は CPU の `@.` broadcast と GPU の Reactant.jl (XLA backend) で共通の言語機能として提供される — CPU で検証した最適化パターンがそのまま GPU に持ち越せる
 
 ### Chip variant の影響 -- Base vs Pro/Max
 
@@ -266,7 +266,9 @@ hidden=1024+ では BLAS が計算時間の >90% を占め、**1回の sgemm が
 結果として:
 
 - **小行列 (hidden <= 256)**: AMX contention が顕著。言語間のスケーリング差が大きい。学習は推論の半分程度のスケーリング
-- **大行列 (hidden >= 1024)**: AMX contention は一定量あるが、per-call 実行時間が長いためパイプライン効率が上がる。全言語が ~3.0--3.5x の T4/T1 に収束すると予測される
+- **大行列 (hidden >= 1024)**: AMX contention は一定量あるが、per-call 実行時間が長いためパイプライン効率が上がる。BLAS 比率が増大し、言語間差は縮小する
+
+**注意: 本分析は Apple M1 (AMX) 固有の結果である。** 本番 GPU 環境では Rust と Julia の kernel launch overhead は同等（両者とも zero-GC、直接メモリ制御）になるが、Julia は Reactant.jl（XLA backend）による自動カーネル融合という構造的優位を保持する。Rust が GPU で同等の融合効率を達成するには、手動 CUDA カーネルまたは Burn 等のフレームワーク支援が必要。Python vs {Rust, Julia, Go} の差が本分析のロバストなシグナルであり、Rust vs Julia の差は M1 AMX 固有で GPU では縮小する（ただし融合ギャップにより完全には消えない可能性がある）。
 
 ---
 
