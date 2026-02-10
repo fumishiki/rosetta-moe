@@ -16,7 +16,7 @@ go/
 ├── generate.go     # Sampling strategies (greedy, temperature, top-K, top-P)
 ├── train.go        # CrossEntropy loss, AdamW optimizer, LR schedule, checkpointing, loss scaling
 ├── sgemm.go        # Apple Accelerate CGO wrapper (cblas_sgemm)
-├── bench_test.go   # Benchmark harness (4 axes: memory, compiler, type system, parallel)
+├── bench_test.go   # Benchmark harness (5 axes: memory, compiler, type system, parallel, scale)
 ├── nn_test.go      # Unit and integration tests
 └── go.mod          # Module definition (Go 1.22+)
 ```
@@ -125,19 +125,21 @@ Latest benchmark results (M1, batch=2, seq=32, hidden=64):
 
 | Metric | Value | Rank (of 4 languages) |
 |--------|-------|------|
-| Forward pass | 1.28ms | 3rd (Rust 0.55ms, Julia 0.56ms) |
-| Train step | 1.93ms | 3rd (Julia 0.49ms, Rust 0.58ms) |
-| Matmul 64×64 | 296 GFLOPS | 3rd |
-| Softmax kernel | 6.0us | 3rd (Rust 2.2us, Julia 4.9us) |
-| Peak RSS | 25MB | 2nd (Rust 14MB) |
-| T4 throughput | 1,948 inf/s | 4th (tied with Python 1,968) |
-| GC throughput | 0.987-0.993 | Best among GC languages |
+| Forward pass | 1.14ms | 3rd (Rust 0.56ms, Julia 0.59ms) |
+| Train step | 3.28ms | 3rd (Julia 0.98ms, Rust 1.44ms) |
+| Matmul 64×64 | 536 GFLOPS | 3rd |
+| Softmax kernel | 5.67us | 3rd (Rust 1.83us, Julia 4.83us) |
+| RMSNorm kernel | 8.75us | 3rd (Rust 3.38us, Julia 4.17us) |
+| Peak RSS | 31MB | 2nd (Rust 19MB) |
+| T4 throughput | 2,189 inf/s | 3rd |
+| T4 train | 867 trn/s | 3rd |
+| GC throughput | 0.985-0.996 | Best among GC languages |
 
-**GC is invisible**: 19.5M bytes allocated per forward pass, yet GC throughput never drops below 0.987. Go's concurrent tracing GC is tuned for latency — it sacrifices throughput headroom to minimize pause impact. Under this ML workload, GC is a non-issue.
+**GC is invisible**: 28.9M bytes allocated per train step, yet GC throughput never drops below 0.985. Go's concurrent tracing GC is tuned for latency — it sacrifices throughput headroom to minimize pause impact. Under this ML workload, GC is a non-issue.
 
-**CGO overhead is the bottleneck**: ~1us per BLAS call. At 64×64 this is ~2x Rust's direct FFI overhead. At production matrix sizes (1024+), the overhead would be negligible.
+**CGO overhead is the bottleneck**: ~1us per BLAS call. At 64×64 this is ~2x Rust's direct FFI overhead. At production matrix sizes, the overhead would be negligible.
 
-**Compiler optimization ceiling**: Go's compiler (gc) is designed for fast compilation, not peak codegen. Without LLVM, it cannot auto-vectorize or exploit SIMD. softmax (6.0us) is 3x Rust (2.2us) — this is the compiler gap, not the language.
+**Compiler optimization ceiling**: Go's compiler (gc) is designed for fast compilation, not peak codegen. Without LLVM, it cannot auto-vectorize or exploit SIMD. softmax (5.67us) is 3.1x Rust (1.83us) — this is the compiler gap, not the language.
 
 **Go's value proposition is not "fastest" — it's "fast enough with lowest total cost of ownership."** Simplest codebase, fastest compilation, most straightforward deployment.
 

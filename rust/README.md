@@ -22,7 +22,7 @@ rust/
 │   ├── simd.rs             # NEON SIMD intrinsics (fast rsqrt, AdamW vectorized step)
 │   └── accelerate.rs       # Apple Accelerate BLAS FFI (cblas_sgemm)
 └── benches/
-    └── bench.rs            # 4-axis benchmark harness (17 scenarios)
+    └── bench.rs            # 5-axis benchmark harness (22 scenarios)
 ```
 
 ### Dependency DAG
@@ -160,21 +160,22 @@ Latest benchmark results (M1, batch=2, seq=32, hidden=64):
 
 | Metric | Value | Rank (of 4 languages) |
 |--------|-------|------|
-| Forward pass | 0.55ms | 1st (tied with Julia 0.56ms) |
-| Train step | 0.58ms | 2nd (Julia 0.49ms) |
-| Matmul 64x64 | 599 GFLOPS | 1st* (tied with Julia 629, within noise) |
-| Softmax kernel | 2.2us | 1st (Julia 4.9us, Go 6.0us) |
-| RMSNorm kernel | 3.2us | 1st (Julia 4.2us, Go 8.5us) |
-| Peak RSS | 14MB | 1st (Go 25MB, Python 52MB, Julia 440MB) |
-| Train alloc | 0.7MB | 2nd (Julia 0.3MB) |
-| T4 throughput | 4,568 inf/s | 2nd (Julia 4,881) |
+| Forward pass | 0.56ms | **1st** (Julia 0.59ms) |
+| Train step | 1.44ms | 2nd (Julia 0.98ms) |
+| Matmul 64x64 | 629 GFLOPS | 1st* (tied with Julia 629, within noise) |
+| Softmax kernel | 1.83us | **1st** (Julia 4.83us, Go 5.67us) |
+| RMSNorm kernel | 3.38us | **1st** (Julia 4.17us, Go 8.75us) |
+| Peak RSS | 19MB | **1st** (Go 31MB, Python 61MB, Julia 490MB) |
+| Train alloc | 1.4MB | 2nd (Julia 3.0MB) |
+| T4 throughput | 4,732 inf/s | **1st** (Julia 4,226) |
+| T4 train | 1,309 trn/s | 2nd (Julia 1,558) |
 | GC throughput | 1.000 | N/A (no GC exists) |
 
 **Why Rust leads non-BLAS kernels**: LLVM AOT produces the tightest scalar loops -- bounds checks eliminated via iterator chains, aggressive inlining, auto-vectorization where possible.
 
-**Why Julia leads training by 17%**: Julia's `@fastmath` enables approximate SIMD for ALL float ops (sqrt, exp, log) in a block. Rust's NEON rsqrt matches Julia for sqrt, but cross-entropy loss/grad still uses precise IEEE 754 `libm` exp/log. This is by design -- Rust requires explicit `unsafe` for each approximation.
+**Why Julia leads training by 1.47x**: Julia's `@.` broadcast fusion is a **language-level fusion compilation** capability that fuses multiple element-wise operations into a single pass, eliminating intermediate allocations. On CPU, this manifests as `@.` broadcast; on GPU, the same capability manifests as Reactant.jl (XLA backend) for automatic whole-graph kernel fusion. Rust has no equivalent automatic fusion -- each element-wise backward operation runs as a separate loop. Rust's NEON rsqrt matches Julia for AdamW sqrt, but the backward pass architecture gap persists.
 
-**RSS advantage**: 14MB total = no runtime, no GC, no JIT. Model weights (~0.1MB at hidden=64) + stack. Julia's equivalent performance costs 440MB for the JIT runtime.
+**RSS advantage**: 19MB total = no runtime, no GC, no JIT. Model weights (~0.1MB at hidden=64) + stack. Julia's equivalent performance costs 490MB for the JIT runtime.
 
 ## Gotchas / Pitfalls
 

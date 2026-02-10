@@ -14,7 +14,7 @@ python/
 ├── model.py       # MoETransformer: full pipeline (embed -> blocks -> norm -> lm_head)
 ├── generate.py    # Sampling strategies: greedy, temperature, top-k, top-p
 ├── train.py       # AdamW optimizer, cross-entropy loss, LR schedule, grad clipping
-├── bench.py       # 4-axis benchmark harness (17 scenarios); JSON output to stdout
+├── bench.py       # 5-axis benchmark harness (22 scenarios); JSON output to stdout
 ├── __init__.py    # Package exports
 └── tests/
     └── test_integration.py
@@ -94,22 +94,22 @@ Latest benchmark results (M1, batch=2, seq=32, hidden=64):
 
 | Metric | Value | Rank (of 4 languages) |
 |--------|-------|------|
-| Forward pass | 2.30ms | 4th (Rust 0.55ms, Julia 0.56ms, Go 1.28ms) |
-| Train step | 5.82ms | 4th |
-| Matmul 64x64 | 176 GFLOPS | 4th |
-| Softmax kernel | 17.3us | 4th (Rust 2.2us) |
-| Peak RSS | 52MB | 3rd |
-| T4 throughput | 1,968 inf/s | 3rd (tied with Go 1,948) |
+| Forward pass | 2.53ms | 4th (Rust 0.56ms, Julia 0.59ms, Go 1.14ms) |
+| Train step | 10.22ms | 4th |
+| Matmul 64x64 | 164 GFLOPS | 4th |
+| Softmax kernel | 16.17us | 4th (Rust 1.83us) |
+| RMSNorm kernel | 23.38us | 4th (Rust 3.38us) |
+| Peak RSS | 61MB | 3rd |
+| T4 throughput | 1,859 inf/s | 4th |
+| T4 train | 503 trn/s | 4th |
 
 **NumPy closes the BLAS gap**: `np.matmul` dispatches to Accelerate with zero developer effort. No FFI wrapper needed.
 
-**CPython interpreter is the bottleneck**: softmax (17.3us) is 8x Rust (2.2us), rmsnorm (22.4us) is 7x. Every non-BLAS operation pays the interpreter dispatch tax: bytecode decode, dynamic type check, reference counting. In-place optimizations help 10-15% but cannot overcome this fundamental overhead.
+**CPython interpreter is the bottleneck**: softmax (16.17us) is 8.8x Rust (1.83us), rmsnorm (23.38us) is 6.9x. Every non-BLAS operation pays the interpreter dispatch tax: bytecode decode, dynamic type check, reference counting. In-place optimizations help 10-15% but cannot overcome this fundamental overhead. At h=64, **90% of every training step** is interpreter overhead (see root README for production-scale cost analysis).
 
-**ProcessPoolExecutor matches Go**: When pool is pre-created with `initializer=` callback, Python achieves 1,968 inf/s at T4 -- tied with Go's goroutine-based 1,948 inf/s.
+**~2ms fixed overhead**: At small inputs (batch=1, seq=8), Python takes ~1.9ms while Rust takes 0.16ms. This interpreter overhead does not scale with workload size.
 
-**~2ms fixed overhead**: At small inputs (batch=1, seq=8), Python takes 1.93ms while Rust takes 0.16ms. This interpreter overhead does not scale with workload size.
-
-**Python's real value is not in this benchmark**: The same model prototype here can be validated with NumPy, then deployed with PyTorch/JAX on GPU -- without changing languages.
+**Python's real value is not in this benchmark**: The same model prototype here can be validated with NumPy, then deployed with PyTorch/JAX on GPU — where torch.compile and CUDA Graphs bypass the interpreter entirely. See root README for why these are "escape hatches from Python."
 
 ## Gotchas / Pitfalls
 
