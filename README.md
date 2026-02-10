@@ -1,6 +1,6 @@
-# machine_learning
+# rosetta-moe
 
-[![CI](https://github.com/fumi-engineer/machine_learning/actions/workflows/ci.yml/badge.svg)](https://github.com/fumi-engineer/machine_learning/actions/workflows/ci.yml)
+[![CI](https://github.com/fumishiki/rosetta-moe/actions/workflows/ci.yml/badge.svg)](https://github.com/fumishiki/rosetta-moe/actions/workflows/ci.yml)
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange)
 ![Go](https://img.shields.io/badge/Go-1.22-blue)
@@ -341,7 +341,7 @@ All 4 implementations converge to ~0.02 (from ~7.5), confirming gradient correct
 ## Project Structure
 
 ```text
-machine_learning/
+rosetta-moe/
 ├── rust/                 # Rust: LLVM AOT + NEON SIMD + Accelerate FFI
 │   └── src/bin/convergence.rs  # Loss convergence verification (Rust)
 ├── go/                   # Go: CGO Accelerate bridge + goroutines

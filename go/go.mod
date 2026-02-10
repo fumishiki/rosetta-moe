@@ -1,3 +1,3 @@
-module github.com/fumi-engineer/machine_learning/go
+module github.com/fumishiki/rosetta-moe/go
 
 go 1.22
