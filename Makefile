@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: CC-BY-4.0
 # Copyright (c) 2025-2026 fumi-engineer
 
-# machine_learning — 4-language MoE Transformer benchmark
+# rosetta-moe — 4-language MoE Transformer benchmark
 # Usage:
 #   make test          Run all tests (Rust + Go + Python + Julia)
 #   make bench         Run all benchmarks and save JSON
@@ -15,6 +15,10 @@
         bench bench-rust bench-go bench-python bench-julia bench-cool \
         convergence convergence-rust convergence-go convergence-python convergence-julia \
         clean verify summary check-docs
+
+# Benchmarks must run sequentially (1 language at a time) to avoid
+# AMX/thermal contention that would invalidate measurements.
+.NOTPARALLEL:
 
 # --- Configuration ---
 ROOT     := $(shell pwd)
