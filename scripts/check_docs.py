@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: CC-BY-NC-4.0
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0
 # Copyright (c) 2025-2026 fumi-engineer
 
 """Verify docs/bench-results.md and README.md against benchmarks/*.json.

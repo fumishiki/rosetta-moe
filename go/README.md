@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # Go MoE Transformer
 
 From-scratch Mixture-of-Experts Transformer in Go.

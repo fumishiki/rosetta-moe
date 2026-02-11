@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # Educational SLM Comparison Spec (CPU-Only)
 
 ## 1. Purpose

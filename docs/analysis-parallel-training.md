@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # AMX コプロセッサから読み解く 4言語並列学習ベンチマーク
 
 ## ベンチマーク結果

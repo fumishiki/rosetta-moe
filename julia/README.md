@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # Julia MoE Transformer
 
 Educational Mixture-of-Experts Transformer implementation in pure Julia. Part of a 4-language benchmark suite (Rust, Go, Python, Julia) for comparing language characteristics in ML workloads.

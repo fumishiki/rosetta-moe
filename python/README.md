@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # Python MoE Transformer
 
 Pure Python + NumPy implementation of a Mixture-of-Experts Transformer. No PyTorch, no JAX -- every operation and every gradient is hand-implemented using NumPy as the sole numerical backend. The benchmark uses a tiny model configuration for cross-language comparison; the educational value is in the explicit math, not the scale.

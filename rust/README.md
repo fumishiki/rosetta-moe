@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # Rust MoE Transformer (`nn-core`)
 
 Educational CPU-only Mixture-of-Experts Transformer in Rust, built on Apple Accelerate BLAS. Part of a 4-language (Rust, Julia, Go, Python) benchmark suite comparing language characteristics for ML workloads.

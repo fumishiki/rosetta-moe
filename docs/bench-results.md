@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # Educational SLM Benchmark: 4-Language Comparison
 
 **Date**: 2026-02-10

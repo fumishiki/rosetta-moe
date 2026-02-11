@@ -1,7 +1,9 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+
 # rosetta-moe
 
 [![CI](https://github.com/fumishiki/rosetta-moe/actions/workflows/ci.yml/badge.svg)](https://github.com/fumishiki/rosetta-moe/actions/workflows/ci.yml)
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange)
 ![Go](https://img.shields.io/badge/Go-1.22-blue)
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
@@ -404,4 +406,4 @@ Each language directory contains its own README with architecture overview, 21-e
 
 ## License
 
-Licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). See [LICENSE](LICENSE) for details.
+Licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). See [LICENSE](LICENSE) for details.
