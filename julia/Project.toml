@@ -1,7 +1,7 @@
 name = "MoETransformer"
 uuid = "f225dc8c-907a-4468-a86b-d18a973532d6"
 version = "0.1.0"
-license = "CC-BY-4.0"
+license = "CC-BY-NC-4.0"
 
 [deps]
 AppleAccelerate = "13e28ba4-7ad8-5781-acae-3021b1ed3924"
