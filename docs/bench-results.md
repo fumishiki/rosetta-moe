@@ -2,9 +2,64 @@
 
 # Educational SLM Benchmark: 4-Language Comparison
 
-**Date**: 2026-02-10
+**Date**: 2026-02-12
 **Platform**: Darwin 25.2.0 (MacBook Air M1, 8-core: 4 perf + 4 eff, 16GB unified memory)
 **Model**: MoE Transformer (hidden=64, vocab=1000, seed=42)
+
+## 0. Latest Snapshot (2026-02-12)
+
+This section is the current source-of-truth summary generated from:
+
+- `benchmarks/rust.json`
+- `benchmarks/go.json`
+- `benchmarks/python.json`
+- `benchmarks/julia.json`
+
+### h=64 Core Metrics
+
+| Language | Forward | Train | T4 Inference | T4 Training | softmax | RSS |
+|----------|---------|-------|--------------|-------------|---------|-----|
+| Rust | 0.60 ms | 1.29 ms | 4,579 inf/s | 1,055 trn/s | 1.83 us | 20 MB |
+| Julia | 0.59 ms | 0.99 ms | 4,256 inf/s | 1,528 trn/s | 4.83 us | 536 MB |
+| Go | 1.09 ms | 3.92 ms | 2,511 inf/s | 578 trn/s | 5.67 us | 33 MB |
+| Python | 1.76 ms | 6.43 ms | 2,229 inf/s | 792 trn/s | 15.40 us | 57 MB |
+
+### Parallel Scaling
+
+| Language | T1 inf/s | T2 inf/s | T4 inf/s | T4/T1 |
+|----------|----------|----------|----------|-------|
+| Rust | 1,753 | 3,101 | 4,579 | 2.61x |
+| Julia | 1,545 | 2,812 | 4,256 | 2.75x |
+| Go | 915 | 1,570 | 2,511 | 2.74x |
+| Python | 989 | 1,536 | 2,229 | 2.25x |
+
+| Language | T1 trn/s | T2 trn/s | T4 trn/s | T4/T1 |
+|----------|----------|----------|----------|-------|
+| Rust | 743 | 1,029 | 1,055 | 1.42x |
+| Julia | 999 | 1,488 | 1,528 | 1.53x |
+| Go | 309 | 547 | 578 | 1.87x |
+| Python | 298 | 499 | 792 | 2.66x |
+
+### h=256 Scale
+
+| Language | Forward h=256 | Train h=256 |
+|----------|---------------|-------------|
+| Rust | 3.71 ms | 19.71 ms |
+| Julia | 3.61 ms | 9.81 ms |
+| Go | 5.28 ms | 38.64 ms |
+| Python | 4.41 ms | 29.43 ms |
+
+### Spread Summary
+
+- Forward spread h=64: 2.97x (python/julia)
+- Train spread h=64: 6.46x (python/julia)
+- Forward spread h=256: 1.46x (go/julia)
+- Train spread h=256: 3.94x (go/julia)
+
+### Historical Sections
+
+Sections below (`## 1` onward) preserve earlier deep-dive narrative context.
+They may reference older run values. For current reporting, prefer `## 0. Latest Snapshot`.
 
 | Language | Version | BLAS integration | Call path |
 |----------|---------|-----------------|-----------|
@@ -193,17 +248,17 @@ Pure kernel throughput. All kernel benchmarks pre-allocate output buffers and me
 
 | Kernel | Rust (us) | Julia (us) | Go (us) | Python (us) | Known FLOPS |
 |--------|-----------|------------|---------|-------------|-------------|
-| matmul 64x64 | **0.79** | 0.96 | 0.88 | 3.17 | 524,288 |
-| softmax (1000) | **1.81** | 4.83 | 5.65 | 16.17 | 4,000 |
-| rmsnorm (2,32,64) | **3.38** | 4.33 | 8.60 | 22.60 | 12,288 |
+| matmul 64x64 | **0.88** | **0.88** | 0.90 | 3.06 | 524,288 |
+| softmax (1000) | **1.83** | 4.83 | 5.67 | 15.40 | 4,000 |
+| rmsnorm (2,32,64) | **3.46** | 4.50 | 9.21 | 23.19 | 12,288 |
 
 | Kernel | Rust | Julia | Go | Python |
 |--------|------|-------|----|--------|
-| matmul (GFLOPS) | **662** | 547 | 599 | 166 |
-| softmax (GFLOPS) | **2.21** | 0.83 | 0.71 | 0.27 |
-| rmsnorm (GFLOPS) | **3.64** | 2.84 | 1.43 | 0.54 |
+| matmul (GFLOPS) | **599** | **599** | 586 | 171 |
+| softmax (GFLOPS) | **2.18** | 0.83 | 0.71 | 0.26 |
+| rmsnorm (GFLOPS) | **3.55** | 2.73 | 1.33 | 0.53 |
 
-Rust and Julia near-tied on matmul (662 vs 547 GFLOPS, within noise at 64x64). Rust wins softmax with tightest scalar loops via LLVM (1.81us) and leads rmsnorm (3.38us, 3.64 GFLOPS). Matmul GFLOPS spread (166-662) reflects FFI dispatch noise at small 64x64 size — all use the same `cblas_sgemm` underneath. Go CGO bridge overhead and Python NumPy dispatch overhead visible.
+Rust and Julia are tied on matmul (~599 GFLOPS at 64x64, within noise). Rust wins softmax (1.83us) and rmsnorm (3.46us). Matmul GFLOPS spread remains mostly small-kernel dispatch noise because all languages call the same `cblas_sgemm`.
 
 Rust's 662 GFLOPS represents 44% of the M1 chip's theoretical f32 peak (~1.49 TFLOPS). Julia's 547 GFLOPS = 37%. For comparison, production GEMM libraries typically achieve 70-90% of peak on large matrices (1024+). The 37-44% figures reflect the small 64x64 matrix size, where per-call FFI dispatch and AMX pipeline setup overhead consume a significant fraction of total time relative to actual compute.
 
@@ -220,13 +275,13 @@ Dispatch overhead and type specialization cost.
 
 | Metric | Rust | Julia | Go | Python |
 |--------|------|-------|----|--------|
-| dispatch_warm (ms) | **0.57** | 0.61 | 1.14 | 2.37 |
-| dispatch_cold (ms) | 5.21 | **2.45** | 8.22 | 10.83 |
-| cold/warm ratio | 9.22 | 4.01 | 7.22 | 4.58 |
+| dispatch_warm (ms) | 0.60 | **0.59** | 1.09 | 1.76 |
+| dispatch_cold (ms) | 5.45 | **2.44** | 8.09 | 10.44 |
+| cold/warm ratio | 9.14 | 4.11 | 7.40 | 5.92 |
 
 "Warm" measures the steady-state forward pass with all JIT compilation and caches warmed up. "Cold" measures model construction plus the first forward pass, which includes JIT compilation for Julia and binary/library loading for compiled languages. The cold/warm ratio shows how much one-time setup cost each language incurs.
 
-Rust leads warm dispatch (0.57ms), ahead of Julia (0.61ms). Both ~2x faster than Go (1.14ms). Julia cold fastest (2.45ms) thanks to JIT incremental compilation. Rust's high cold/warm ratio (9.22) reflects extremely fast warm path making construction cost proportionally larger. Go and Python show high cold/warm ratios (7.22, 4.58) due to runtime initialization and library loading overhead.
+Julia leads warm dispatch in this run (0.59ms), with Rust effectively tied (0.60ms). Julia cold remains fastest (2.44ms) thanks to JIT incremental compilation. Rust's high cold/warm ratio (9.14) reflects an extremely fast warm path.
 
 ---
 
@@ -246,9 +301,9 @@ Per-language semantics:
 
 | Threads | Julia (ms) | Rust (ms) | Go (ms) | Python (ms) |
 |---------|------------|-----------|---------|-------------|
-| T1 | 0.686 | **0.574** | 1.145 | 1.303 |
-| T2 | 0.771 | **0.647** | 1.345 | 1.575 |
-| T4 | 0.949 | **0.841** | 1.882 | 2.098 |
+| T1 | 0.647 | **0.570** | 1.092 | 1.011 |
+| T2 | 0.711 | **0.645** | 1.274 | 1.302 |
+| T4 | 0.940 | **0.873** | 1.593 | 1.795 |
 
 Python ProcessPoolExecutor with pre-created pool and initialized workers (matching Go/Rust/Julia methodology). Rust parallel uses thread-local alloc counter + barrier-based thread pool.
 
@@ -256,18 +311,18 @@ Python ProcessPoolExecutor with pre-created pool and initialized workers (matchi
 
 | Threads | Julia (inf/s) | Rust (inf/s) | Go (inf/s) | Python (inf/s) |
 |---------|---------------|-------------|-----------|----------------|
-| T1 | 1,458 | **1,742** | 874 | 768 |
-| T2 | 2,591 | **3,084** | 1,486 | 1,268 |
-| T4 | 4,205 | **4,738** | 2,121 | 1,898 |
+| T1 | 1,545 | **1,753** | 915 | 989 |
+| T2 | 2,812 | **3,101** | 1,570 | 1,536 |
+| T4 | 4,256 | **4,579** | 2,511 | 2,229 |
 
 | Speedup | Julia | Go | Rust | Python |
 |---------|-------|-------|------|--------|
-| T2/T1 | **1.78x** | 1.70x | 1.77x | 1.65x |
-| T4/T1 | **2.88x** | 2.43x | 2.72x | 2.47x |
+| T2/T1 | **1.82x** | 1.72x | 1.77x | 1.55x |
+| T4/T1 | **2.75x** | 2.74x | 2.61x | 2.25x |
 
-Rust leads T4 throughput (4,738 inf/s), followed by Julia (4,205 inf/s), Go (2,121 inf/s), and Python (1,898 inf/s). Julia shows best T4/T1 scaling ratio (2.88x), followed by Rust (2.72x), Python (2.47x), and Go (2.43x). Sub-linear scaling due to AMX contention.
+Rust leads T4 throughput (4,579 inf/s), followed by Julia (4,256 inf/s), Go (2,511 inf/s), and Python (2,229 inf/s). Julia shows the best T4/T1 scaling ratio (2.75x), with Go close (2.74x). Scaling remains sub-linear due to AMX contention.
 
-Rust parallel improved significantly (previous: 2,705 inf/s T4) via thread-local alloc counter + barrier-based thread pool + inference-mode allocation elimination, reaching 4,738 inf/s T4.
+Rust parallel improved significantly from earlier baselines, reaching 4,579 inf/s at T4 in the current run.
 
 Scaling is sub-linear because the Apple AMX coprocessor is a shared hardware resource. When multiple threads issue BLAS calls simultaneously, they may serialize at the AMX level rather than executing in true parallel. Additionally, for workloads this small (~0.6-1.3ms per inference), thread creation and synchronization overhead becomes a significant fraction of total time.
 
@@ -283,17 +338,17 @@ Per-language semantics:
 
 | Threads | Julia (trn/s) | Rust (trn/s) | Go (trn/s) | Python (trn/s) |
 |---------|---------------|-------------|-----------|----------------|
-| T1 | **943** | 758 | 311 | 175 |
-| T2 | **1,490** | 1,170 | 524 | 311 |
-| T4 | **1,558** | 1,309 | 867 | 503 |
+| T1 | **999** | 743 | 309 | 298 |
+| T2 | **1,488** | 1,029 | 547 | 499 |
+| T4 | **1,528** | 1,055 | 578 | 792 |
 
 | Speedup | Julia | Rust | Go | Python |
 |---------|-------|------|-------|--------|
-| T4/T1 | 1.65x | 1.73x | **2.79x** | **2.88x** |
+| T4/T1 | 1.53x | 1.42x | 1.87x | **2.66x** |
 
-Julia leads absolute training throughput at all thread counts (943→1,558 trn/s). Rust 2nd (758→1,309). Scaling ratios invert: Go (2.79x) and Python (2.88x) show better T4/T1 ratios than Julia (1.65x) and Rust (1.73x). This is explained by Amdahl's Law — Julia/Rust spend more time in BLAS (AMX-bound, serialized), while Go/Python's slower non-BLAS code is fully parallelizable. See [analysis-parallel-training.md](analysis-parallel-training.md) for detailed AMX architecture analysis.
+Julia leads absolute training throughput at all thread counts (999→1,528 trn/s). Rust is 2nd (743→1,055). Python shows the highest T4/T1 ratio in this run (2.66x), while Julia/Rust remain lower due to heavier AMX-bound fractions.
 
-Training parallel scaling is significantly lower than inference scaling (Julia: 1.65x vs 2.88x, Rust: 1.73x vs 2.72x) because backward pass triples AMX bus transactions (~72 sgemm/step vs ~24 for inference).
+Training parallel scaling is significantly lower than inference scaling for Julia/Rust (due to backward pass AMX pressure, ~72 sgemm/step vs ~24 for inference).
 
 ---
 
@@ -303,15 +358,15 @@ Training parallel scaling is significantly lower than inference scaling (Julia: 
 
 | Axis | 1st | 2nd | 3rd | 4th |
 |------|-----|-----|-----|-----|
-| Memory (forward) | **Rust** (0.57ms, 0 GC) | Julia (0.61ms, 0 GC) | Go (1.14ms) | Python (2.37ms) |
-| Memory (train) | **Julia** (1.00ms, 0 GC) | Rust (1.31ms, 0 GC) | Go (3.33ms) | Python (10.03ms) |
-| Compiler (matmul) | **Rust** (662 GFLOPS) | Go (599 GFLOPS) | Julia (547 GFLOPS) | Python (166 GFLOPS) |
-| Compiler (softmax) | **Rust** (1.81us) | Julia (4.83us) | Go (5.65us) | Python (16.17us) |
-| Compiler (rmsnorm) | **Rust** (3.38us) | Julia (4.33us) | Go (8.60us) | Python (22.60us) |
-| Type system (warm) | **Rust** (0.57ms) | Julia (0.61ms) | Go (1.14ms) | Python (2.37ms) |
-| Parallel (T4 throughput) | **Rust** (4,738 inf/s) | Julia (4,205 inf/s) | Go (2,121 inf/s) | Python (1,898 inf/s) |
-| Parallel Training (T4) | **Julia** (1,558 trn/s) | Rust (1,309 trn/s) | Go (867 trn/s) | Python (503 trn/s) |
-| Scale (forward h=256) | **Rust** (2.88ms) | Julia (3.51ms) | Python (5.15ms) | Go (5.47ms) |
+| Memory (forward) | **Julia** (0.59ms, 0 GC) | Rust (0.60ms, 0 GC) | Go (1.09ms) | Python (1.76ms) |
+| Memory (train) | **Julia** (0.99ms, 0 GC) | Rust (1.29ms, 0 GC) | Go (3.92ms) | Python (6.43ms) |
+| Compiler (matmul) | **Rust** (599 GFLOPS) | Julia (599 GFLOPS) | Go (586 GFLOPS) | Python (171 GFLOPS) |
+| Compiler (softmax) | **Rust** (1.83us) | Julia (4.83us) | Go (5.67us) | Python (15.40us) |
+| Compiler (rmsnorm) | **Rust** (3.46us) | Julia (4.50us) | Go (9.21us) | Python (23.19us) |
+| Type system (warm) | **Julia** (0.59ms) | Rust (0.60ms) | Go (1.09ms) | Python (1.76ms) |
+| Parallel (T4 throughput) | **Rust** (4,579 inf/s) | Julia (4,256 inf/s) | Go (2,511 inf/s) | Python (2,229 inf/s) |
+| Parallel Training (T4) | **Julia** (1,528 trn/s) | Rust (1,055 trn/s) | Python (792 trn/s) | Go (578 trn/s) |
+| Scale (forward h=256) | **Julia** (3.61ms) | Rust (3.71ms) | Python (4.41ms) | Go (5.28ms) |
 
 Note: Matmul GFLOPS differences between Rust and Julia (662 vs 547) are within measurement noise at 64x64 — both use the same BLAS (`cblas_sgemm`). The spread reflects sub-microsecond FFI dispatch variance, not compute difference.
 
@@ -498,35 +553,35 @@ This benchmark uses hidden=64 to expose language overhead. To verify that perfor
 
 | Language | hidden=64 | hidden=256 | Growth | vs Fastest |
 |----------|-----------|------------|--------|------------|
-| **Rust** | **0.57ms** | **2.88ms** | 5.1x | 1.00x |
-| Julia | 0.61ms | 3.51ms | 5.8x | 1.22x |
-| Python | 2.37ms | 5.15ms | 2.2x | 1.79x |
-| Go | 1.14ms | 5.47ms | 4.8x | 1.90x |
-| **Spread** | **4.16x** | **1.90x** | | **-54%** |
+| Julia | **0.59ms** | **3.61ms** | 6.1x | 1.00x |
+| Rust | 0.60ms | 3.71ms | 6.2x | 1.03x |
+| Python | 1.76ms | 4.41ms | 2.5x | 1.22x |
+| Go | 1.09ms | 5.28ms | 4.8x | 1.46x |
+| **Spread** | **2.97x** | **1.46x** | | **-51%** |
 
 #### Measured: Training Step Convergence (batch=2, seq=8)
 
 | Language | hidden=64 | hidden=256 | Growth | vs Fastest |
 |----------|-----------|------------|--------|------------|
-| **Julia** | **1.00ms** | **9.46ms** | 9.5x | 1.00x |
-| Rust | 1.31ms | 16.91ms | 12.9x | 1.79x |
-| Go | 3.33ms | 37.55ms | 11.3x | 3.97x |
-| Python | 10.03ms | 49.18ms | 4.9x | 5.20x |
-| **Spread** | **10.03x** | **5.20x** | | **-48%** |
+| **Julia** | **0.99ms** | **9.81ms** | 9.9x | 1.00x |
+| Rust | 1.29ms | 19.71ms | 15.3x | 2.01x |
+| Go | 3.92ms | 38.64ms | 9.9x | 3.94x |
+| Python | 6.43ms | 29.43ms | 4.6x | 3.00x |
+| **Spread** | **6.46x** | **3.94x** | | **-39%** |
 
 #### Key Findings from hidden=256
 
-**1. Forward spread reduced 54%** (4.16x → 1.90x). At hidden=64, non-BLAS overhead is significant. At hidden=256, BLAS fraction grows and the gap narrows dramatically. Rust leads at both scales after inference-mode optimization.
+**1. Forward spread reduced 51%** (2.97x → 1.46x). As hidden size increases, BLAS fraction grows and language overhead is amortized.
 
-**2. Training spread reduced 48%** (10.03x → 5.20x). Julia maintains training lead at both scales (1.00ms → 9.46ms). Convergence is slower than forward because backward pass implementations differ more fundamentally across languages.
+**2. Training spread reduced 39%** (6.46x → 3.94x). Julia maintains the training lead at both scales (0.99ms → 9.81ms).
 
-**3. Rust leads forward at both scales.** Rust leads at h=64 (0.57ms) and h=256 (2.88ms). Julia at 1.22x (3.51ms) at h=256. The gap narrows at h=256 as BLAS fraction grows.
+**3. Forward is near-tied between Julia and Rust in this run.** h=64: Julia 0.59ms vs Rust 0.60ms. h=256: Julia 3.61ms vs Rust 3.71ms.
 
-**4. Julia training lead persists at scale.** Julia (9.46ms) leads Rust (16.91ms) at h=256 by 1.79x. This reflects Julia's **language-level fusion compilation**: the `@.` broadcast compiler fuses multiple element-wise operations into a single pass, eliminating intermediate allocations. This is not a CPU-specific trick — on GPU, the same capability manifests as [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (XLA backend) for automatic whole-graph kernel fusion. Rust has no equivalent automatic fusion; closing this gap would require hand-written CUDA kernels or framework support (e.g., Burn).
+**4. Julia training lead persists at scale.** Julia (9.81ms) leads Rust (19.71ms) at h=256 by about 2.0x. This aligns with Julia's fused element-wise path advantages in backward-heavy workloads.
 
-**5. Python training slowest at scale** (49.18ms at h=256, 5.20x slowest). The CPython interpreter overhead compounds with backward pass complexity at larger model sizes.
+**5. Go is slowest on training at h=256 in this run** (38.64ms), with Python close (29.43ms). Backward-path overhead dominates both.
 
-**6. Julia training growth highest** (9.5x for 4x hidden). This reflects Julia's efficient backward pass scaling — broadcast fusion handles larger tensors without proportional allocation increase.
+**6. Growth factors differ by language/runtime path.** Rust shows the largest train growth (15.3x) from h=64→256, while Python's growth is lower due to larger fixed overhead at h=64.
 
 #### Measured Convergence Trend
 

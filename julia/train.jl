@@ -212,6 +212,75 @@ function _cross_entropy_grad_permuted!(gd::Array{Float32,N1},
     nothing
 end
 
+# Fused cross-entropy: computes both loss and d_logits in one softmax pass.
+# This avoids running softmax/permutedims twice in train_step!.
+function cross_entropy_loss_grad_into!(grad_buf::Array{Float32}, logits::Tensor, targets::Tensor;
+                                       perm_buf::Union{Array{Float32,3}, Nothing}=nothing,
+                                       grad_perm_buf::Union{Array{Float32,3}, Nothing}=nothing)::Tuple{Float32,Tensor}
+    dims = size(logits)
+    batch, seq_len, vocab_size = dims[1], dims[2], dims[3]
+    num_tokens = batch * seq_len
+    gd = size(grad_buf) == dims ? grad_buf : Array{Float32}(undef, dims...)
+    loss = _cross_entropy_loss_grad_permuted!(
+        gd,
+        logits.data,
+        targets.data,
+        batch,
+        seq_len,
+        vocab_size,
+        num_tokens,
+        perm_buf,
+        grad_perm_buf,
+    )
+    loss, Tensor(gd, logits.dtype)
+end
+
+function _cross_entropy_loss_grad_permuted!(gd::Array{Float32,N1},
+                                            ld::Array{Float32,N2},
+                                            td::Array{Float32,N3},
+                                            batch::Int, seq_len::Int, vocab_size::Int, num_tokens::Int,
+                                            perm_buf::Union{Array{Float32,3}, Nothing},
+                                            grad_perm_buf::Union{Array{Float32,3}, Nothing})::Float32 where {N1,N2,N3}
+    perm_sz = (vocab_size, batch, seq_len)
+    if perm_buf === nothing || size(perm_buf) != perm_sz
+        perm_buf = Array{Float32}(undef, perm_sz...)
+    end
+    permutedims!(perm_buf, ld, (3, 1, 2))
+
+    if grad_perm_buf === nothing || size(grad_perm_buf) != perm_sz
+        grad_perm_buf = Array{Float32}(undef, perm_sz...)
+    end
+
+    total_loss = 0f0
+    @fastmath for b in 1:batch, s in 1:seq_len
+        mx = -Inf32
+        @inbounds for v in 1:vocab_size
+            val = perm_buf[v, b, s]
+            mx = ifelse(val > mx, val, mx)
+        end
+        sm = 0f0
+        @inbounds for v in 1:vocab_size
+            e = exp(perm_buf[v, b, s] - mx)
+            grad_perm_buf[v, b, s] = e
+            sm += e
+        end
+        inv_s = 1f0 / sm
+        @inbounds @simd for v in 1:vocab_size
+            grad_perm_buf[v, b, s] *= inv_s
+        end
+        @inbounds target_idx = Int(td[b, s]) + 1
+        @inbounds total_loss -= log(max(grad_perm_buf[target_idx, b, s], 1f-12))
+        @inbounds grad_perm_buf[target_idx, b, s] -= 1f0
+    end
+
+    sc = 1f0 / Float32(num_tokens)
+    @inbounds @simd for i in eachindex(grad_perm_buf)
+        grad_perm_buf[i] *= sc
+    end
+    permutedims!(gd, grad_perm_buf, (2, 3, 1))
+    total_loss * sc
+end
+
 # Gradient clipping: ||g||_2 > clip_norm => g *= clip_norm / ||g||_2
 # Uses function barrier for SIMD on concrete Array{Float32,N}.
 function clip_grad_by_global_norm!(t::Tensor, clip_norm::Float32)::Float32
@@ -292,16 +361,15 @@ function train_step!(t::Trainer, input::Tensor, targets::Tensor)::Float32
     if t.ce_grad_perm_buf === nothing || size(t.ce_grad_perm_buf) != perm_sz
         t.ce_grad_perm_buf = Array{Float32}(undef, perm_sz...)
     end
-    loss = cross_entropy_loss(logits, targets; perm_buf=t.ce_perm_buf)
-    aux_loss = total_aux_loss(t.model, t.config.aux_alpha)
-    total_loss = loss + aux_loss
-    # Reuse gradient buffer
+    # Fused loss+grad path avoids a duplicate softmax/permutedims pass.
     if t.grad_buf === nothing || size(t.grad_buf) != dims
         t.grad_buf = Array{Float32}(undef, dims...)
     end
-    grad_output = cross_entropy_grad_into!(t.grad_buf, logits, targets;
-                                           perm_buf=t.ce_perm_buf,
-                                           grad_perm_buf=t.ce_grad_perm_buf)
+    loss, grad_output = cross_entropy_loss_grad_into!(t.grad_buf, logits, targets;
+                                                      perm_buf=t.ce_perm_buf,
+                                                      grad_perm_buf=t.ce_grad_perm_buf)
+    aux_loss = total_aux_loss(t.model, t.config.aux_alpha)
+    total_loss = loss + aux_loss
     clip_grad_by_global_norm!(grad_output, t.config.grad_clip)
     backward(t.model, grad_output)
     lr = get_lr(t)

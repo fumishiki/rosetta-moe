@@ -12,6 +12,7 @@ package nn
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -619,6 +620,9 @@ func TestMasterWeights(t *testing.T) {
 // This test verifies that the training loop reduces loss over multiple iterations,
 // demonstrating that the optimizer and gradient computation are functioning correctly.
 func TestConvergence(t *testing.T) {
+	// Fix RNG seed so weight initialization is reproducible across runs.
+	rand.Seed(42)
+
 	m := NewTiny()
 	cfg := TrainConfig{
 		LR:          1e-3,

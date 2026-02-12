@@ -246,17 +246,15 @@ class Linear(Layer):
 
         # Flatten leading dims to 2D for matmul
         orig_shape = x.shape
+        flat_x = x.data.reshape(-1, self.in_features)
         batch_dims = orig_shape[:-1]
-        batch_size = int(np.prod(batch_dims))
-
-        flat_x = x.data.reshape(batch_size, self.in_features)
 
         # y = x @ W^T  (dispatches to BLAS sgemm via np.matmul)
         # .T returns a view (zero-copy) — numpy/BLAS handles the strided access
         result = np.matmul(flat_x, self.weight.data.T)
 
         if self.bias is not None:
-            result = result + self.bias.data
+            np.add(result, self.bias.data, out=result)
 
         return Tensor.from_numpy(result.reshape((*batch_dims, self.out_features)))
 
@@ -272,11 +270,8 @@ class Linear(Layer):
             raise RuntimeError("backward called before forward")
 
         input_shape = self._last_input.shape
-        batch_dims = grad_output.shape[:-1]
-        batch_size = int(np.prod(batch_dims))
-
-        flat_grad = grad_output.data.reshape(batch_size, self.out_features)
-        flat_input = self._last_input.data.reshape(batch_size, self.in_features)
+        flat_grad = grad_output.data.reshape(-1, self.out_features)
+        flat_input = self._last_input.data.reshape(-1, self.in_features)
 
         # grad_input = grad_output @ W
         grad_input = np.matmul(flat_grad, self.weight.data)
@@ -284,17 +279,17 @@ class Linear(Layer):
         # grad_weight = grad_output^T @ input  shape: [out_features, in_features]
         grad_w = np.matmul(flat_grad.T, flat_input)
         if self.weight._grad is None:
-            self.weight._grad = grad_w.astype(np.float32)
+            self.weight._grad = grad_w
         else:
-            self.weight._grad += grad_w.astype(np.float32)
+            self.weight._grad += grad_w
 
         # grad_bias = sum over batch dims
         if self.bias is not None:
             grad_b = np.sum(flat_grad, axis=0)
             if self.bias._grad is None:
-                self.bias._grad = grad_b.astype(np.float32)
+                self.bias._grad = grad_b
             else:
-                self.bias._grad += grad_b.astype(np.float32)
+                self.bias._grad += grad_b
 
         return Tensor.from_numpy(grad_input.reshape(input_shape))
 
@@ -330,8 +325,7 @@ class SwiGLU(Layer):
         self.down = Linear(ffn_dim, hidden_dim, bias=False)
 
         # Cache for backward
-        self._last_gate_out: Tensor | None = None
-        self._last_up_out: Tensor | None = None
+        self._last_up_out: np.ndarray | None = None
         self._last_gate_pre_silu: np.ndarray | None = None
         self._last_input: Tensor | None = None
 
@@ -351,14 +345,13 @@ class SwiGLU(Layer):
         gate_out = self.gate.forward(x)
         up_out = self.up.forward(x)
 
-        self._last_up_out = up_out
+        self._last_up_out = up_out.data
         # Cache pre-silu gate output for backward (before in-place mutation)
         self._last_gate_pre_silu = gate_out.data.copy()
 
         # In-place SiLU on gate, then in-place multiply with up projection
         # Saves 2 temporary Tensor allocations vs gate_out.silu() * up_out
         gate_out.silu_inplace()
-        self._last_gate_out = Tensor.from_numpy(gate_out.data.copy())  # silu(gate)
         gate_out.mul_inplace(up_out)
 
         # Down projection back to hidden_dim
@@ -381,20 +374,20 @@ class SwiGLU(Layer):
         grad_hidden = self.down.backward(grad_output)
 
         # Split grad to gate and up paths
-        up_data = self._last_up_out.data
-        silu_gate_data = self._last_gate_out.data  # silu(gate(x))
+        up_data = self._last_up_out
         gate_pre_silu = self._last_gate_pre_silu   # gate(x) before silu
 
         gh = grad_hidden.data
 
         # grad w.r.t. up output:  d(silu(g) * u)/du = silu(g)
-        grad_up_out = Tensor.from_numpy(gh * silu_gate_data)
+        sigmoid_g = 1.0 / (1.0 + np.exp(-gate_pre_silu))
+        silu_gate = gate_pre_silu * sigmoid_g
+        grad_up_out = Tensor.from_numpy(gh * silu_gate)
 
         # grad w.r.t. silu(gate) output:  d(silu(g) * u)/d(silu(g)) = u
         grad_silu_out = gh * up_data
 
         # silu'(z) = sigmoid(z) * (1 + z * (1 - sigmoid(z)))
-        sigmoid_g = 1.0 / (1.0 + np.exp(-gate_pre_silu))
         dsilu = sigmoid_g * (1.0 + gate_pre_silu * (1.0 - sigmoid_g))
         grad_gate_out = Tensor.from_numpy(grad_silu_out * dsilu)
 

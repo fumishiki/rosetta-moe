@@ -35,8 +35,6 @@ pub struct MQAttention {
     /// Precomputed RoPE frequencies: freq[i] = 1 / base^(2i/d)
     freqs: Vec<f32>,
     /// Cached forward data for backward
-    last_input: Option<Vec<f32>>,
-    last_input_shape: Option<Shape>,
     last_q: Option<Vec<f32>>,
     last_k: Option<Vec<f32>>,
     last_v: Option<Vec<f32>>,
@@ -87,8 +85,6 @@ impl MQAttention {
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             freqs,
-            last_input: None,
-            last_input_shape: None,
             last_q: None,
             last_k: None,
             last_v: None,
@@ -138,10 +134,6 @@ impl Layer for MQAttention {
     fn forward(&mut self, input: &Tensor) -> Tensor {
         let (batch, seq_len, _) = input.dims_3d();
 
-        if !self.inference_mode {
-            self.last_input = Some(input.data().to_vec());
-            self.last_input_shape = Some(input.shape().clone());
-        }
         self.last_batch = batch;
         self.last_seq_len = seq_len;
 
@@ -152,12 +144,6 @@ impl Layer for MQAttention {
 
         // Step 2: Apply RoPE to Q and K (in-place to avoid allocation)
         self.apply_rope(q.data_mut(), k.data_mut(), batch, seq_len);
-
-        if !self.inference_mode {
-            self.last_q = Some(q.data().to_vec());
-            self.last_k = Some(k.data().to_vec());
-            self.last_v = Some(v.data().to_vec());
-        }
 
         let q_data = q.data();
         let k_data = k.data();
@@ -227,6 +213,10 @@ impl Layer for MQAttention {
         self.scores_buf = scores;
 
         if !self.inference_mode {
+            // Move Q/K/V caches out without cloning (used by backward).
+            self.last_q = Some(q.into_data());
+            self.last_k = Some(k.into_data());
+            self.last_v = Some(v.into_data());
             self.last_attn_weights = Some(all_weights);
         }
 
@@ -261,11 +251,6 @@ impl Layer for MQAttention {
         let k_data = self.last_k.take().unwrap_or_default();
         let v_data = self.last_v.take().unwrap_or_default();
         let attn_weights = self.last_attn_weights.take().unwrap_or_default();
-        let input_data = self.last_input.take().unwrap_or_default();
-        let input_shape = self
-            .last_input_shape
-            .take()
-            .unwrap_or_else(|| Shape::new(&[]));
 
         // Reuse or allocate gradient buffers for Q, K, V
         // Layout: [batch, seq, heads, head_dim] flattened
@@ -412,19 +397,8 @@ impl Layer for MQAttention {
             Shape::new(&[batch, seq_len, self.n_kv_heads * self.head_dim]),
         );
 
-        // Set cached input for Q/K/V projections (they all used the same input x)
-        // Share the same data: clone once for q, move original to k, recover from k for v
-        self.q_proj.last_input = Some(input_data.clone());
-        self.q_proj.last_batch = batch * seq_len;
-        self.k_proj.last_input = Some(input_data);
-        self.k_proj.last_batch = batch * seq_len;
-        // v_proj reuses k_proj's data after k_proj backward (see below)
-        self.v_proj.last_batch = batch * seq_len;
-
         let mut grad_x_q = self.q_proj.backward(&grad_q_tensor);
         let grad_x_k = self.k_proj.backward(&grad_k_tensor);
-        // After k_proj backward, pass its cached input to v_proj (avoids a clone)
-        self.v_proj.last_input = self.k_proj.last_input.take();
         let grad_x_v = self.v_proj.backward(&grad_v_tensor);
 
         // Recover buffers from consumed tensors for reuse on next step

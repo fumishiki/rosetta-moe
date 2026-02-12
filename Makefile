@@ -13,7 +13,7 @@
 
 .PHONY: test test-rust test-go test-python test-julia \
         bench bench-rust bench-go bench-python bench-julia bench-cool \
-        convergence convergence-rust convergence-go convergence-python convergence-julia \
+        convergence convergence-rust convergence-go convergence-python convergence-julia convergence-plots \
         clean verify summary check-docs
 
 # Benchmarks must run sequentially (1 language at a time) to avoid
@@ -102,6 +102,10 @@ convergence-python:
 convergence-julia:
 	@printf "$(HDR)[Julia]  Convergence...\033[0m "
 	@cd $(ROOT) && julia scripts/convergence_julia.jl | python3 -c "import sys,json;d=json.loads(sys.stdin.read());l=d['losses'];print(f'{l[0]:.4f} -> {l[-1]:.4f} (delta={l[-1]-l[0]:+.4f})')"
+
+convergence-plots:
+	@printf "$(HDR)[All]    Convergence + per-language SVG plots...\033[0m\n"
+	@cd $(ROOT) && python3 scripts/convergence_plots.py
 
 # --- Doc verification: JSON vs docs ---
 check-docs:

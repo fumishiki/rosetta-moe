@@ -42,6 +42,7 @@ class Router:
         self._last_weights: np.ndarray | None = None
         self._last_indices: np.ndarray | None = None
         self._last_gate_probs: np.ndarray | None = None
+        self._probs_buf: np.ndarray | None = None
 
     def forward(self, x: Tensor) -> tuple[np.ndarray, np.ndarray]:
         """Compute router weights and expert indices.
@@ -61,23 +62,27 @@ class Router:
         # Flatten to [num_tokens, hidden_dim] using raw numpy to avoid Tensor overhead
         flat_x = Tensor.from_numpy(x.data.reshape(num_tokens, self.hidden_dim))
 
-        # Gate logits -> softmax probabilities
-        gate_logits = self.gate.forward(flat_x)
-        gate_probs = gate_logits.softmax()
-        self._last_gate_probs = gate_probs.data
+        # Gate logits -> softmax probabilities (in-place into reusable buffer)
+        gate_logits = self.gate.forward(flat_x).data
+        if self._probs_buf is None or self._probs_buf.shape != gate_logits.shape:
+            self._probs_buf = np.empty_like(gate_logits)
+        probs_2d = self._probs_buf
+        np.subtract(gate_logits, np.max(gate_logits, axis=-1, keepdims=True), out=probs_2d)
+        np.exp(probs_2d, out=probs_2d)
+        np.divide(probs_2d, np.sum(probs_2d, axis=-1, keepdims=True), out=probs_2d)
+        self._last_gate_probs = probs_2d
 
         # Top-k selection via np.argpartition: O(N) average vs O(N log N) for full sort.
         # argpartition only guarantees the top-k elements are in the first k positions,
         # so we sort within the top-k afterwards for deterministic ordering.
-        probs_2d = gate_probs.data  # [num_tokens, n_experts]
-        part_idx = np.argpartition(-probs_2d, self.top_k, axis=-1)[:, :self.top_k]
+        part_idx = np.argpartition(-probs_2d, self.top_k - 1, axis=-1)[:, :self.top_k]
         top_weights_unsorted = np.take_along_axis(probs_2d, part_idx, axis=-1)
         # Sort the top-k by descending probability for deterministic ordering
         sort_idx = np.argsort(-top_weights_unsorted, axis=-1)
         top_indices = np.take_along_axis(part_idx, sort_idx, axis=-1)
         top_weights = np.take_along_axis(top_weights_unsorted, sort_idx, axis=-1)
         # Renormalize so top-k weights sum to 1 per token
-        top_weights /= np.sum(top_weights, axis=-1, keepdims=True)
+        top_weights /= np.maximum(np.sum(top_weights, axis=-1, keepdims=True), 1e-12)
 
         # Keep as numpy arrays (avoid .tolist() Python list conversion overhead)
         self._last_weights = top_weights
@@ -154,6 +159,15 @@ class MoELayer:
         self.experts = [
             SwiGLU(config.hidden_dim, config.ffn_dim) for _ in range(config.n_experts)
         ]
+        self._last_dispatch_tokens: list[np.ndarray | None] = [None] * config.n_experts
+        self._last_dispatch_weights: list[np.ndarray | None] = [None] * config.n_experts
+        self._token_ids_cache: np.ndarray | None = None
+
+    def _token_ids(self, num_tokens: int) -> np.ndarray:
+        """Return cached [0..num_tokens-1] token ids."""
+        if self._token_ids_cache is None or self._token_ids_cache.shape[0] != num_tokens:
+            self._token_ids_cache = np.arange(num_tokens, dtype=np.int64)
+        return self._token_ids_cache
 
     def forward(self, x: Tensor) -> Tensor:
         """MoE forward pass.
@@ -179,32 +193,42 @@ class MoELayer:
         # Flatten input using raw numpy to avoid Tensor overhead
         flat_x = x.data.reshape(num_tokens, self.hidden_dim)
 
-        # Cache for backward pass
-        self._last_input = x
-        self._last_flat_x = flat_x
-        self._last_weights = weights
-        self._last_indices = indices_arr
         self._last_batch_shape = (batch, seq_len)
 
-        # Expert-batched dispatch: iterate over experts, not tokens.
+        # Expert-batched dispatch (Rust-style inversion):
+        #   token -> top-k experts  =>  expert -> assigned token list
         output = np.zeros((num_tokens, self.hidden_dim), dtype=np.float32)
+        token_ids = self._token_ids(num_tokens)
+        flat_token_ids = np.repeat(token_ids, self.top_k)
+        flat_experts = indices_arr.reshape(-1)
+        flat_weights = weights.reshape(-1).astype(np.float32, copy=False)
+        order = np.argsort(flat_experts, kind="stable")
+        sorted_experts = flat_experts[order]
+        sorted_tokens = flat_token_ids[order]
+        sorted_weights = flat_weights[order]
+        bounds = np.searchsorted(sorted_experts, np.arange(self.n_experts + 1), side="left")
+
+        # Reset dispatch cache
+        self._last_dispatch_tokens = [None] * self.n_experts
+        self._last_dispatch_weights = [None] * self.n_experts
 
         for expert_idx in range(self.n_experts):
-            # Vectorized: boolean mask of all (token, k) pairs assigned to this expert
-            mask = indices_arr == expert_idx  # [num_tokens, top_k]
-            token_mask = np.any(mask, axis=1)  # [num_tokens] — True if any k-slot hits this expert
-            if not np.any(token_mask):
+            start = bounds[expert_idx]
+            end = bounds[expert_idx + 1]
+            if start == end:
                 continue
 
-            token_indices = np.where(token_mask)[0]
-            # Sum weights for this expert per token (handles rare duplicate assignments)
-            token_weights_arr = np.sum(weights[token_mask] * mask[token_mask], axis=1, keepdims=True).astype(np.float32)
+            token_indices = sorted_tokens[start:end]
+            token_weights = sorted_weights[start:end]
+            self._last_dispatch_tokens[expert_idx] = token_indices
+            self._last_dispatch_weights[expert_idx] = token_weights
 
             batch_input = Tensor.from_numpy(flat_x[token_indices])
             batch_output = self.experts[expert_idx].forward(batch_input)
 
-            # Weighted accumulation using np.add.at for scatter-add semantics.
-            np.add.at(output, token_indices, token_weights_arr * batch_output.data)
+            # token_indices are unique for a given expert (top-k has unique experts per token),
+            # so direct indexed accumulation is safe and faster than np.add.at.
+            output[token_indices] += token_weights[:, None] * batch_output.data
 
         return Tensor.from_numpy(output.reshape((batch, seq_len, self.hidden_dim)))
 
@@ -218,37 +242,23 @@ class MoELayer:
         num_tokens = batch * seq_len
 
         flat_grad = grad_output.data.reshape(num_tokens, self.hidden_dim)
-        weights = self._last_weights
-        indices_arr = self._last_indices
-        flat_x = self._last_flat_x
 
         grad_input = np.zeros((num_tokens, self.hidden_dim), dtype=np.float32)
 
         for expert_idx in range(self.n_experts):
-            mask = indices_arr == expert_idx
-            token_mask = np.any(mask, axis=1)
-            if not np.any(token_mask):
+            token_indices = self._last_dispatch_tokens[expert_idx]
+            token_weights = self._last_dispatch_weights[expert_idx]
+            if token_indices is None or token_weights is None:
                 continue
 
-            token_indices = np.where(token_mask)[0]
-            token_weights_arr = np.sum(
-                weights[token_mask] * mask[token_mask], axis=1, keepdims=True
-            ).astype(np.float32)
-
             # Weighted gradient for this expert's output
-            expert_grad = Tensor.from_numpy(flat_grad[token_indices] * token_weights_arr)
-
-            # Set _last_input for the expert's sub-layers (re-run input through cache)
-            expert_input = Tensor.from_numpy(flat_x[token_indices])
-            self.experts[expert_idx]._last_input = expert_input
-            self.experts[expert_idx].gate._last_input = expert_input
-            self.experts[expert_idx].up._last_input = expert_input
+            expert_grad = Tensor.from_numpy(flat_grad[token_indices] * token_weights[:, None])
 
             # Backward through the expert (accumulates weight gradients)
             grad_expert_input = self.experts[expert_idx].backward(expert_grad)
 
-            # Accumulate input gradient (scatter-add for multiple experts per token)
-            np.add.at(grad_input, token_indices, grad_expert_input.data)
+            # token_indices are unique for this expert, so direct accumulation is safe.
+            grad_input[token_indices] += grad_expert_input.data
 
         return Tensor.from_numpy(grad_input.reshape(batch, seq_len, self.hidden_dim))
 

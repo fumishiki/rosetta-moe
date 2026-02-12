@@ -208,8 +208,8 @@ mutable struct MoELayer <: AbstractLayer
     last_leading::Tuple  # leading dims for output reshape
     # Backward pre-allocated buffers
     grad_input_buf::Matrix{Float32}       # (num_tokens, hidden_dim) — reused each backward
-    bwd_expert_grad_buf::Matrix{Float32}  # (max_tok_per_expert, hidden_dim)
-    bwd_expert_input_buf::Matrix{Float32} # (max_tok_per_expert, hidden_dim)
+    bwd_expert_grad_bufs::Vector{Matrix{Float32}}   # per-expert grad batch buffers
+    bwd_expert_input_bufs::Vector{Matrix{Float32}}  # per-expert input batch buffers
 end
 
 function MoELayer(hidden_dim::Int, ffn_dim::Int, n_experts::Int, top_k::Int)
@@ -217,12 +217,14 @@ function MoELayer(hidden_dim::Int, ffn_dim::Int, n_experts::Int, top_k::Int)
     et = [Int[] for _ in 1:n_experts]
     ewi = [Int[] for _ in 1:n_experts]
     ebb = [Matrix{Float32}(undef, 0, 0) for _ in 1:n_experts]
+    beg = [Matrix{Float32}(undef, 0, 0) for _ in 1:n_experts]
+    bei = [Matrix{Float32}(undef, 0, 0) for _ in 1:n_experts]
     MoELayer(Router(hidden_dim, n_experts, top_k), experts, hidden_dim, n_experts, top_k,
              Matrix{Float32}(undef, 0, 0), ebb, et, ewi,
              Matrix{Float32}(undef, 0, 0), 0, (),  # last_flat_data, last_num_tokens, last_leading
              Matrix{Float32}(undef, 0, hidden_dim),   # grad_input_buf
-             Matrix{Float32}(undef, 0, hidden_dim),   # bwd_expert_grad_buf
-             Matrix{Float32}(undef, 0, hidden_dim))   # bwd_expert_input_buf
+             beg,                                      # bwd_expert_grad_bufs
+             bei)                                      # bwd_expert_input_bufs
 end
 
 # MoE forward: output = sum_k(gate_k * Expert_k(x)) for top-k experts per token
@@ -240,7 +242,7 @@ function _moelayer_forward!(m::MoELayer, id::Array{Float32,N}, dtype::DType) whe
     leading, num_tokens, _ = _split_last(dims)
     input_tensor = Tensor(id, dtype)
 
-    weights, indices = forward(m.router, input_tensor)
+    _, indices = forward(m.router, input_tensor)
     # Extract concrete types from Router output for type stability
     wd = m.router.weights_buf
     flat_data = reshape(id, num_tokens, m.hidden_dim)
@@ -285,10 +287,10 @@ function _moelayer_forward!(m::MoELayer, id::Array{Float32,N}, dtype::DType) whe
         isempty(tokens) && continue
         n_tok = length(tokens)
 
-        # Per-expert batch buffer (grow-only: never shrinks to avoid reallocation)
+        # Per-expert batch buffer: keep exact shape to avoid slice-copy fallback.
         eb = m.expert_batch_bufs[e_idx]
-        if size(eb, 1) < n_tok || size(eb, 2) != hidden_dim
-            m.expert_batch_bufs[e_idx] = Matrix{Float32}(undef, max(n_tok, size(eb, 1)), hidden_dim)
+        if size(eb, 1) != n_tok || size(eb, 2) != hidden_dim
+            m.expert_batch_bufs[e_idx] = Matrix{Float32}(undef, n_tok, hidden_dim)
         end
         bb = m.expert_batch_bufs[e_idx]
 
@@ -299,14 +301,7 @@ function _moelayer_forward!(m::MoELayer, id::Array{Float32,N}, dtype::DType) whe
             end
         end
 
-        # Wrap buffer as Tensor — if buffer matches exactly, wrap directly (zero alloc).
-        # Otherwise need a slice copy (this alloc is O(n_tok*hidden_dim)).
-        if size(bb, 1) == n_tok
-            batch_input = Tensor(bb, F32)
-        else
-            batch_data = bb[1:n_tok, :]  # unavoidable copy for mismatched size
-            batch_input = Tensor(batch_data, F32)
-        end
+        batch_input = Tensor(bb, F32)
 
         expert_out = forward(m.experts[e_idx], batch_input)
         # Scatter-add: accumulate weighted expert output back to each token's position
@@ -324,7 +319,9 @@ function _moe_accumulate!(od::Matrix{Float32}, eod::Array{Float32,N}, tokens::Ve
     @inbounds for (i, t) in enumerate(tokens)
         k = weight_idx[i]
         w = wd[t, k]
-        @views @fastmath od[t, :] .+= w .* eod_flat[i, :]
+        @simd for d in 1:hidden_dim
+            od[t, d] += w * eod_flat[i, d]
+        end
     end
 end
 
@@ -348,38 +345,33 @@ function backward(m::MoELayer, grad_output::Tensor)
         n_tok = length(tokens)
         weight_idx = m.expert_weight_idx[e_idx]
 
-        # Reuse expert_grad buffer (grow-only)
-        if size(m.bwd_expert_grad_buf, 1) < n_tok
-            m.bwd_expert_grad_buf = Matrix{Float32}(undef, n_tok, hidden_dim)
+        # Per-expert grad buffer: exact shape avoids row-slice copies.
+        if size(m.bwd_expert_grad_bufs[e_idx], 1) != n_tok || size(m.bwd_expert_grad_bufs[e_idx], 2) != hidden_dim
+            m.bwd_expert_grad_bufs[e_idx] = Matrix{Float32}(undef, n_tok, hidden_dim)
         end
-        expert_grad_data = m.bwd_expert_grad_buf
+        expert_grad_data = m.bwd_expert_grad_bufs[e_idx]
 
         @inbounds for (i, t) in enumerate(tokens)
             k = weight_idx[i]
             w = wd[t, k]
-            @views @fastmath expert_grad_data[i, :] .= w .* flat_grad[t, :]
+            @simd for d in 1:hidden_dim
+                expert_grad_data[i, d] = w * flat_grad[t, d]
+            end
         end
-        # Slice if buffer is larger than needed
-        if size(expert_grad_data, 1) == n_tok
-            expert_grad = Tensor(expert_grad_data, grad_output.dtype)
-        else
-            expert_grad = Tensor(expert_grad_data[1:n_tok, :], grad_output.dtype)
-        end
+        expert_grad = Tensor(expert_grad_data, grad_output.dtype)
 
-        # Reuse expert_input buffer (grow-only)
-        if size(m.bwd_expert_input_buf, 1) < n_tok
-            m.bwd_expert_input_buf = Matrix{Float32}(undef, n_tok, hidden_dim)
+        # Per-expert input buffer: exact shape avoids row-slice copies.
+        if size(m.bwd_expert_input_bufs[e_idx], 1) != n_tok || size(m.bwd_expert_input_bufs[e_idx], 2) != hidden_dim
+            m.bwd_expert_input_bufs[e_idx] = Matrix{Float32}(undef, n_tok, hidden_dim)
         end
-        expert_input_data = m.bwd_expert_input_buf
+        expert_input_data = m.bwd_expert_input_bufs[e_idx]
 
         @inbounds for (i, t) in enumerate(tokens)
-            @views expert_input_data[i, :] .= flat_x[t, :]
+            @simd for d in 1:hidden_dim
+                expert_input_data[i, d] = flat_x[t, d]
+            end
         end
-        if size(expert_input_data, 1) == n_tok
-            expert_input = Tensor(expert_input_data, grad_output.dtype)
-        else
-            expert_input = Tensor(expert_input_data[1:n_tok, :], grad_output.dtype)
-        end
+        expert_input = Tensor(expert_input_data, grad_output.dtype)
 
         # Set cached input for expert sub-layers (gate, up need the original input)
         m.experts[e_idx].w_gate.last_input = expert_input
@@ -392,7 +384,9 @@ function backward(m::MoELayer, grad_output::Tensor)
         # Scatter-add: accumulate expert input gradient back to token positions
         ge_flat = reshape(ge_data, n_tok, hidden_dim)
         @inbounds for (i, t) in enumerate(tokens)
-            @views @fastmath grad_input[t, :] .+= ge_flat[i, :]
+            @simd for d in 1:hidden_dim
+                grad_input[t, d] += ge_flat[i, d]
+            end
         end
     end
 

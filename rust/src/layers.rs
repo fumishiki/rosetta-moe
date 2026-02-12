@@ -430,11 +430,10 @@ pub struct SwiGLU {
     pub(crate) up_proj: Linear,
     pub(crate) down_proj: Linear,
     /// Cached activations for backward
-    pub(crate) last_input: Option<Vec<f32>>,
-    pub(crate) last_input_shape: Option<Shape>,
     pub(crate) last_gate_pre_silu: Option<Vec<f32>>,
-    pub(crate) last_silu_gate: Option<Vec<f32>>,
     pub(crate) last_up_out: Option<Vec<f32>>,
+    grad_gate_buf: Option<Vec<f32>>,
+    grad_up_buf: Option<Vec<f32>>,
     inference_mode: bool,
 }
 
@@ -444,11 +443,10 @@ impl SwiGLU {
             gate_proj: Linear::new(hidden_dim, ffn_dim),
             up_proj: Linear::new(hidden_dim, ffn_dim),
             down_proj: Linear::new(ffn_dim, hidden_dim),
-            last_input: None,
-            last_input_shape: None,
             last_gate_pre_silu: None,
-            last_silu_gate: None,
             last_up_out: None,
+            grad_gate_buf: None,
+            grad_up_buf: None,
             inference_mode: false,
         }
     }
@@ -456,28 +454,23 @@ impl SwiGLU {
 
 impl Layer for SwiGLU {
     // SwiGLU: output = Down(SiLU(Gate(x)) * Up(x))
-    // Caches pre-silu gate, silu(gate), and up for backward.
+    // Caches pre-silu gate and up for backward.
     fn forward(&mut self, input: &Tensor) -> Tensor {
-        if !self.inference_mode {
-            self.last_input = Some(input.data().to_vec());
-            self.last_input_shape = Some(input.shape().clone());
-        }
-
         let mut gate = self.gate_proj.forward(input);
         if !self.inference_mode {
-            self.last_gate_pre_silu = Some(gate.data().to_vec());
+            let mut gate_pre = self.last_gate_pre_silu.take().unwrap_or_default();
+            gate_pre.clear();
+            gate_pre.extend_from_slice(gate.data());
+            self.last_gate_pre_silu = Some(gate_pre);
         }
         gate.silu_in_place();
-        if !self.inference_mode {
-            self.last_silu_gate = Some(gate.data().to_vec());
-        }
 
         let up = self.up_proj.forward(input);
-        if !self.inference_mode {
-            self.last_up_out = Some(up.data().to_vec());
-        }
-
         gate.mul_in_place(&up);
+        if !self.inference_mode {
+            // Move expert up-projection output after use to avoid a clone.
+            self.last_up_out = Some(up.into_data());
+        }
         self.down_proj.forward(&gate)
     }
 
@@ -494,28 +487,23 @@ impl Layer for SwiGLU {
         let gh = grad_hidden.data();
 
         let gate_pre_silu = self.last_gate_pre_silu.take().unwrap_or_default();
-        let silu_gate = self.last_silu_gate.take().unwrap_or_default();
         let up_out = self.last_up_out.take().unwrap_or_default();
-        let input_data = self.last_input.take().unwrap_or_default();
-        let input_shape = self
-            .last_input_shape
-            .take()
-            .unwrap_or_else(|| Shape::new(&[]));
 
         let n = gh.len();
-        let mut grad_gate = vec![0.0f32; n];
-        let mut grad_up = vec![0.0f32; n];
+        let mut grad_gate = self.grad_gate_buf.take().unwrap_or_default();
+        grad_gate.resize(n, 0.0);
+        let mut grad_up = self.grad_up_buf.take().unwrap_or_default();
+        grad_up.resize(n, 0.0);
 
         for i in 0..n {
-            // grad_up_out = grad_hidden * silu(gate)
-            grad_up[i] = gh[i] * silu_gate[i];
-
-            // grad_silu_gate = grad_hidden * up_out
-            let grad_silu_out = gh[i] * up_out[i];
-
-            // silu'(z) = sigmoid(z) * (1 + z * (1 - sigmoid(z)))
+            // grad_up_out = grad_hidden * silu(gate_pre_silu)
             let z = gate_pre_silu[i];
             let sig = 1.0 / (1.0 + (-z).exp());
+            let silu = z * sig;
+            grad_up[i] = gh[i] * silu;
+
+            // grad_silu_gate = grad_hidden * up_out, then chain with silu'(z)
+            let grad_silu_out = gh[i] * up_out[i];
             let dsilu = sig * (1.0 + z * (1.0 - sig));
             grad_gate[i] = grad_silu_out * dsilu;
         }
@@ -523,18 +511,11 @@ impl Layer for SwiGLU {
         let grad_gate_tensor = Tensor::from_vec(grad_gate, grad_hidden.shape().clone());
         let grad_up_tensor = Tensor::from_vec(grad_up, grad_hidden.shape().clone());
 
-        // Restore cached input for sub-layer backward (gate_proj and up_proj both used the same input)
-        // Only clone once: move original to gate_proj, reuse after gate backward for up_proj
-        let batch_size = input_shape.batch_size();
-        self.gate_proj.last_input = Some(input_data);
-        self.gate_proj.last_batch = batch_size;
-        self.up_proj.last_batch = batch_size;
-
         // Backward through gate and up projections (accumulates their weight gradients)
         let mut grad_x_gate = self.gate_proj.backward(&grad_gate_tensor);
-        // Reuse gate_proj's cached input for up_proj (avoids a clone)
-        self.up_proj.last_input = self.gate_proj.last_input.take();
         let grad_x_up = self.up_proj.backward(&grad_up_tensor);
+        self.grad_gate_buf = Some(grad_gate_tensor.into_data());
+        self.grad_up_buf = Some(grad_up_tensor.into_data());
 
         // Sum gradients from both paths (in-place to avoid allocation)
         grad_x_gate.add_in_place(&grad_x_up);

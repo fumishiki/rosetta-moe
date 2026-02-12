@@ -337,19 +337,19 @@ func (r *RMSNorm) Parameters() []*Tensor { return []*Tensor{r.weight} }
 //	SwiGLU(x) = (SiLU(W_gate @ x) * (W_up @ x)) @ W_down
 //
 // Expanded:
-//   gate = W_gate @ x             -- project to FFN dim
-//   gate = gate * sigmoid(gate)   -- SiLU activation
-//   up   = W_up @ x               -- parallel up-projection
-//   out  = W_down @ (gate * up)   -- down-project back to hidden dim
+//
+//	gate = W_gate @ x             -- project to FFN dim
+//	gate = gate * sigmoid(gate)   -- SiLU activation
+//	up   = W_up @ x               -- parallel up-projection
+//	out  = W_down @ (gate * up)   -- down-project back to hidden dim
 //
 // Three linear projections: gate [hidden -> ffn], up [hidden -> ffn],
 // down [ffn -> hidden]. No bias in any of them.
 type SwiGLU struct {
-	wGate, wUp, wDown       *Linear
-	hiddenDim, ffnDim       int
-	lastGate, lastUp        *Tensor // cached for backward (silu(gate), up)
-	lastGatePreSiLU         *Tensor // cached pre-SiLU gate output for derivative
-	lastInput               *Tensor // cached input for backward
+	wGate, wUp, wDown *Linear
+	hiddenDim, ffnDim int
+	lastUp            *Tensor // cached for backward (up projection)
+	lastGatePreSiLU   []float32
 }
 
 // NewSwiGLU creates a SwiGLU FFN block.
@@ -366,11 +366,15 @@ func NewSwiGLU(hiddenDim, ffnDim int) *SwiGLU {
 // Forward computes SwiGLU(x) = W_down @ (SiLU(W_gate @ x) * W_up @ x).
 // Caches pre-SiLU gate output for the backward pass SiLU derivative.
 func (s *SwiGLU) Forward(input *Tensor) *Tensor {
-	s.lastInput = input
 	gate := s.wGate.Forward(input)
-	s.lastGatePreSiLU = gate.Clone() // cache pre-SiLU for backward derivative
+	gateData := gate.DataPtr()
+	if cap(s.lastGatePreSiLU) >= len(gateData) {
+		s.lastGatePreSiLU = s.lastGatePreSiLU[:len(gateData)]
+	} else {
+		s.lastGatePreSiLU = make([]float32, len(gateData))
+	}
+	copy(s.lastGatePreSiLU, gateData) // cache pre-SiLU for backward derivative
 	gate.SiLUInPlace()
-	s.lastGate = gate.Clone() // cache silu(gate) before MulInPlace mutates it
 	up := s.wUp.Forward(input)
 	s.lastUp = up
 	gate.MulInPlace(up) // gate is now silu(gate) * up
@@ -385,27 +389,27 @@ func (s *SwiGLU) Backward(gradOutput *Tensor) *Tensor {
 	// Backward through down projection
 	gradHidden := s.wDown.Backward(gradOutput)
 
-	// d(silu(gate) * up) / d(up) = silu(gate)
-	gradUp := gradHidden.Mul(s.lastGate)
-
 	// d(silu(gate) * up) / d(silu(gate)) = up
 	gradSiluGate := gradHidden.Mul(s.lastUp)
+	gradUp := New(gradHidden.Shape(), F32)
 
-	// Apply SiLU derivative: silu'(z) = sigmoid(z) * (1 + z * (1 - sigmoid(z)))
-	preSilu := s.lastGatePreSiLU.DataPtr()
+	// Recompute SiLU(pre_silu) for gradUp and apply SiLU derivative for gradSiluGate.
+	preSilu := s.lastGatePreSiLU
+	gHidden := gradHidden.DataPtr()
 	gSilu := gradSiluGate.DataPtr()
+	gUp := gradUp.DataPtr()
 	for i := range gSilu {
 		z := preSilu[i]
 		sig := 1.0 / (1.0 + ExpF32(-z))
+		silu := z * sig
 		dSilu := sig * (1.0 + z*(1.0-sig))
+		gUp[i] = gHidden[i] * silu
 		gSilu[i] *= dSilu
 	}
 
-	// Ensure lastInput is set for gate and up projections
-	s.wGate.lastInput = s.lastInput
-	s.wUp.lastInput = s.lastInput
-
-	return s.wGate.Backward(gradSiluGate).Add(s.wUp.Backward(gradUp))
+	gradIn := s.wGate.Backward(gradSiluGate)
+	gradIn.AddInPlace(s.wUp.Backward(gradUp))
+	return gradIn
 }
 
 // Parameters returns all weights from gate, up, and down projections.

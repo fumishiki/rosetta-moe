@@ -44,7 +44,13 @@ type Trainer struct {
 	model  *MoETransformer
 	config TrainConfig
 	step   int
+	params []*Tensor
 	states []AdamWState // one per parameter tensor
+	// Reusable scratch to reduce per-step allocations.
+	ceRowBuf     []float32
+	gradLogits   *Tensor
+	beta1PowStep float32
+	beta2PowStep float32
 }
 
 // NewTrainer creates a Trainer with AdamW optimizer state initialized to zero.
@@ -57,14 +63,21 @@ func NewTrainer(m *MoETransformer, cfg TrainConfig) *Trainer {
 			V: Zeros(p.Shape(), F32),
 		}
 	}
-	return &Trainer{model: m, config: cfg, states: states}
+	return &Trainer{
+		model:        m,
+		config:       cfg,
+		params:       params,
+		states:       states,
+		beta1PowStep: 1.0,
+		beta2PowStep: 1.0,
+	}
 }
 
 // GetLR computes the current learning rate using linear warmup + cosine decay.
 //
-//   warmup:  lr = peak_lr * step / warmup_steps
-//   cosine:  lr = min_lr + 0.5*(peak_lr - min_lr)*(1 + cos(pi * progress))
-//   min_lr = 0.1 * peak_lr
+//	warmup:  lr = peak_lr * step / warmup_steps
+//	cosine:  lr = min_lr + 0.5*(peak_lr - min_lr)*(1 + cos(pi * progress))
+//	min_lr = 0.1 * peak_lr
 //
 // This schedule ramps up linearly to prevent training instability at the start,
 // then smoothly decays to 10% of peak.
@@ -85,90 +98,84 @@ func (t *Trainer) Step() int { return t.step }
 
 // crossEntropyLoss computes the mean cross-entropy loss over all positions.
 //
-//   L = -(1/N) * sum_{b,s} log(softmax(logits[b,s])[target[b,s]])
+//	L = -(1/N) * sum_{b,s} log(softmax(logits[b,s])[target[b,s]])
 //
 // Numerically stable via log-sum-exp:
-//   log(softmax(x)_i) = x_i - max(x) - log(sum(exp(x - max(x))))
-func crossEntropyLoss(logits, targets *Tensor) float32 {
+//
+//	log(softmax(x)_i) = x_i - max(x) - log(sum(exp(x - max(x))))
+//
+// crossEntropyLossGrad computes both mean cross-entropy loss and dL/d(logits)
+// in a single pass over logits rows, reusing Trainer scratch buffers.
+func (t *Trainer) crossEntropyLossGrad(logits, targets *Tensor) (float32, *Tensor) {
 	dims := logits.Shape().DimsRef()
 	batch, seqLen, vocabSize := dims[0], dims[1], dims[2]
+	numTokens := batch * seqLen
 
+	// Reuse gradient tensor when shape is unchanged.
+	if t.gradLogits == nil || !t.gradLogits.Shape().Equal(logits.Shape()) {
+		t.gradLogits = New(logits.Shape(), F32)
+	}
+	gradData := t.gradLogits.DataPtr()
 	logitsData := logits.DataPtr()
 	targetsData := targets.DataPtr()
+
+	// Reuse row buffer for softmax.
+	if cap(t.ceRowBuf) < vocabSize {
+		t.ceRowBuf = make([]float32, vocabSize)
+	}
+	rowBuffer := t.ceRowBuf[:vocabSize]
 
 	totalLoss := float32(0)
-	numTokens := batch * seqLen
-
-	for b := 0; b < batch; b++ {
-		for s := 0; s < seqLen; s++ {
-			offset := (b*seqLen + s) * vocabSize
-			targetIdx := int(targetsData[b*seqLen+s])
-			if targetIdx < 0 || targetIdx >= vocabSize {
-				panic("target index out of range in crossEntropyLoss")
-			}
-			row := logitsData[offset : offset+vocabSize]
-
-			// Numerical stability: subtract max before exp
-			_, maxVal := argmax(row)
-
-			sumExp := float32(0)
-			for _, logit := range row {
-				sumExp += ExpF32(logit - maxVal)
-			}
-			// log_prob = logit[target] - max - log(sum_exp)
-			logProb := row[targetIdx] - maxVal - LogF32(sumExp)
-			totalLoss -= logProb
+	for tokenIdx := 0; tokenIdx < numTokens; tokenIdx++ {
+		offset := tokenIdx * vocabSize
+		targetIdx := int(targetsData[tokenIdx])
+		if targetIdx < 0 || targetIdx >= vocabSize {
+			panic("target index out of range in crossEntropyLossGrad")
 		}
+
+		copy(rowBuffer, logitsData[offset:offset+vocabSize])
+		softmaxInPlace(rowBuffer)
+		copy(gradData[offset:offset+vocabSize], rowBuffer)
+
+		// -log p(target), clamp to avoid log(0).
+		p := rowBuffer[targetIdx]
+		if p < 1e-12 {
+			p = 1e-12
+		}
+		totalLoss -= LogF32(p)
+
+		// dlogits = softmax - one_hot(target)
+		gradData[offset+targetIdx] -= 1.0
 	}
 
-	return totalLoss / float32(numTokens)
-}
-
-// crossEntropyGrad computes dL/d(logits) for cross-entropy loss.
-//
-//   grad[b, s, v] = (softmax(logits[b,s])[v] - one_hot(target[b,s])[v]) / N
-//
-// This is the standard softmax gradient: prob - target.
-func crossEntropyGrad(logits, targets *Tensor) *Tensor {
-	dims := logits.Shape().DimsRef()
-	batch, seqLen, vocabSize := dims[0], dims[1], dims[2]
-	numTokens := batch * seqLen
-
-	grad := Zeros(logits.Shape(), F32)
-	logitsData := logits.DataPtr()
-	targetsData := targets.DataPtr()
-	gradData := grad.DataPtr()
-
-	rowBuffer := make([]float32, vocabSize)
-	for b := 0; b < batch; b++ {
-		for s := 0; s < seqLen; s++ {
-			tokenIdx := b*seqLen + s
-			offset := tokenIdx * vocabSize
-			targetIdx := int(targetsData[tokenIdx])
-			if targetIdx < 0 || targetIdx >= vocabSize {
-				panic("target index out of range in crossEntropyGrad")
-			}
-
-			copy(rowBuffer, logitsData[offset:offset+vocabSize])
-			softmaxInPlace(rowBuffer)
-			copy(gradData[offset:offset+vocabSize], rowBuffer)
-			// softmax(logits)[target] - 1.0 (the one-hot subtraction)
-			gradData[offset+targetIdx] -= 1.0
-		}
-	}
-
-	// Average over all tokens
+	// Mean over all tokens.
 	scale := 1.0 / float32(numTokens)
 	for i := range gradData {
 		gradData[i] *= scale
 	}
+	return totalLoss * scale, t.gradLogits
+}
+
+// crossEntropyLoss is kept for compatibility with existing tests/docs.
+// TrainStep uses crossEntropyLossGrad() to avoid duplicate softmax work.
+func crossEntropyLoss(logits, targets *Tensor) float32 {
+	tmp := Trainer{}
+	loss, _ := tmp.crossEntropyLossGrad(logits, targets)
+	return loss
+}
+
+// crossEntropyGrad is kept for compatibility with existing tests/docs.
+// TrainStep uses crossEntropyLossGrad() to compute loss+grad in one pass.
+func crossEntropyGrad(logits, targets *Tensor) *Tensor {
+	tmp := Trainer{}
+	_, grad := tmp.crossEntropyLossGrad(logits, targets)
 	return grad
 }
 
 // clipTensorByGlobalNorm clips the tensor's L2 norm to clipNorm if it exceeds it.
 // Modifies the tensor in-place. Returns the original (pre-clip) norm.
 //
-//   if ||t||_2 > clip_norm:  t = t * (clip_norm / ||t||_2)
+//	if ||t||_2 > clip_norm:  t = t * (clip_norm / ||t||_2)
 func clipTensorByGlobalNorm(t *Tensor, clipNorm float32) float32 {
 	if clipNorm <= 0 {
 		return 0
@@ -191,11 +198,12 @@ func clipTensorByGlobalNorm(t *Tensor, clipNorm float32) float32 {
 // TrainStep performs a single training step: forward, loss, backward, AdamW update.
 //
 // AdamW update rule per parameter:
-//   m = beta1 * m + (1 - beta1) * g           -- first moment
-//   v = beta2 * v + (1 - beta2) * g^2          -- second moment
-//   m_hat = m / (1 - beta1^t)                  -- bias correction
-//   v_hat = v / (1 - beta2^t)                  -- bias correction
-//   w -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * w)
+//
+//	m = beta1 * m + (1 - beta1) * g           -- first moment
+//	v = beta2 * v + (1 - beta2) * g^2          -- second moment
+//	m_hat = m / (1 - beta1^t)                  -- bias correction
+//	v_hat = v / (1 - beta2^t)                  -- bias correction
+//	w -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * w)
 //
 // The weight decay term is applied directly to w (decoupled, hence "AdamW"),
 // not added to the gradient.
@@ -203,21 +211,20 @@ func (t *Trainer) TrainStep(input, targets *Tensor) float32 {
 	t.step++
 
 	// Zero all parameter gradients before forward/backward
-	params := t.model.Parameters()
+	params := t.params
 	for _, p := range params {
 		p.ZeroGrad()
 	}
 
 	// Forward pass
 	logits := t.model.Forward(input)
-	loss := crossEntropyLoss(logits, targets)
+	loss, gradOutput := t.crossEntropyLossGrad(logits, targets)
 
 	// Add auxiliary loss from MoE routers (load balancing)
 	auxLoss := t.model.TotalAuxLoss(t.config.AuxAlpha)
 	totalLoss := loss + auxLoss
 
 	// Backward pass: computes and stores per-parameter gradients on param.Grad
-	gradOutput := crossEntropyGrad(logits, targets)
 	_ = t.model.Backward(gradOutput)
 
 	// Global gradient norm clipping across all parameters
@@ -238,8 +245,10 @@ func (t *Trainer) TrainStep(input, targets *Tensor) float32 {
 
 	// AdamW update using actual per-parameter gradients
 	lr := t.GetLR()
-	mCorr := 1.0 / (1 - PowF32(t.config.Beta1, float32(t.step)))
-	vCorr := 1.0 / (1 - PowF32(t.config.Beta2, float32(t.step)))
+	t.beta1PowStep *= t.config.Beta1
+	t.beta2PowStep *= t.config.Beta2
+	mCorr := 1.0 / (1 - t.beta1PowStep)
+	vCorr := 1.0 / (1 - t.beta2PowStep)
 	b1, b2, eps, wd := t.config.Beta1, t.config.Beta2, t.config.Eps, t.config.WeightDecay
 
 	for i, param := range params {
@@ -256,11 +265,20 @@ func (t *Trainer) TrainStep(input, targets *Tensor) float32 {
 		vData := t.states[i].V.DataPtr()
 		gradSlice := param.Grad
 
-		for j := range paramData {
-			grad := gradSlice[j] * clipCoeff
-			mData[j] = b1*mData[j] + (1-b1)*grad
-			vData[j] = b2*vData[j] + (1-b2)*grad*grad
-			paramData[j] -= lr * (mData[j]*mCorr/(SqrtF32(vData[j]*vCorr)+eps) + wd*paramData[j])
+		if clipCoeff != 1.0 {
+			for j := range paramData {
+				grad := gradSlice[j] * clipCoeff
+				mData[j] = b1*mData[j] + (1-b1)*grad
+				vData[j] = b2*vData[j] + (1-b2)*grad*grad
+				paramData[j] -= lr * (mData[j]*mCorr/(SqrtF32(vData[j]*vCorr)+eps) + wd*paramData[j])
+			}
+		} else {
+			for j := range paramData {
+				grad := gradSlice[j]
+				mData[j] = b1*mData[j] + (1-b1)*grad
+				vData[j] = b2*vData[j] + (1-b2)*grad*grad
+				paramData[j] -= lr * (mData[j]*mCorr/(SqrtF32(vData[j]*vCorr)+eps) + wd*paramData[j])
+			}
 		}
 	}
 

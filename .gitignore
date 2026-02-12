@@ -32,6 +32,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.cache/
 
 # Julia-generated CUDA sources
 cuda/kernels/generated/*.cu

@@ -434,36 +434,26 @@ impl Tensor {
     ) {
         // Take grad out of self to split the borrow (zero-copy move)
         let grad_box = self.grad.take();
-        if let Some(ref g) = grad_box {
-            crate::simd::adamw_step_simd(
-                &mut self.data,
-                m,
-                v,
-                g.data(),
-                lr,
-                beta1,
-                beta2,
-                eps,
-                weight_decay,
-                corr1,
-                corr2,
-            );
-        } else {
-            let zeros = vec![0.0f32; self.data.len()];
-            crate::simd::adamw_step_simd(
-                &mut self.data,
-                m,
-                v,
-                &zeros,
-                lr,
-                beta1,
-                beta2,
-                eps,
-                weight_decay,
-                corr1,
-                corr2,
-            );
-        }
+        let Some(ref g) = grad_box else {
+            // Parameters without gradients are skipped.
+            // This avoids a per-step zero buffer allocation and prevents
+            // optimizer drift on tensors that did not receive grad.
+            self.grad = grad_box;
+            return;
+        };
+        crate::simd::adamw_step_simd(
+            &mut self.data,
+            m,
+            v,
+            g.data(),
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            corr1,
+            corr2,
+        );
         // Put grad back (zero-copy move)
         self.grad = grad_box;
     }

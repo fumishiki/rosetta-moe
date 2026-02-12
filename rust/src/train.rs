@@ -254,6 +254,9 @@ pub struct Trainer {
     optimizer: AdamW,
     config: TrainConfig,
     current_step: usize,
+    // Reusable scratch to avoid duplicate softmax passes and allocations.
+    ce_row_buf: Vec<f32>,
+    grad_logits_buf: Vec<f32>,
 }
 
 impl Trainer {
@@ -265,7 +268,44 @@ impl Trainer {
             optimizer,
             config,
             current_step: 0,
+            ce_row_buf: Vec::new(),
+            grad_logits_buf: Vec::new(),
         }
+    }
+
+    fn cross_entropy_loss_grad(&mut self, logits: &Tensor, targets: &Tensor) -> (f32, Tensor) {
+        let (n, vocab) = logits_layout(logits, targets);
+        let logits_data = logits.data();
+        let targets_data = targets.data();
+
+        if self.ce_row_buf.len() < vocab {
+            self.ce_row_buf.resize(vocab, 0.0);
+        }
+        let row_probs = &mut self.ce_row_buf[..vocab];
+
+        let mut grad = std::mem::take(&mut self.grad_logits_buf);
+        grad.resize(logits.numel(), 0.0);
+
+        let mut total = 0.0f32;
+        for i in 0..n {
+            let start = i * vocab;
+            crate::tensor::softmax_into_slice(&logits_data[start..start + vocab], row_probs);
+            grad[start..start + vocab].copy_from_slice(row_probs);
+
+            let target = checked_target(targets_data[i], vocab);
+            total -= row_probs[target].max(1e-12).ln();
+            grad[start + target] -= 1.0;
+        }
+
+        let inv_n = 1.0 / n as f32;
+        for g in grad.iter_mut() {
+            *g *= inv_n;
+        }
+
+        (
+            total * inv_n,
+            Tensor::from_vec(grad, logits.shape().clone()),
+        )
     }
 
     pub fn train_step(&mut self, input: &Tensor, targets: &Tensor) -> f32 {
@@ -276,10 +316,9 @@ impl Trainer {
         }
 
         let logits = self.model.forward(input);
-        let ce_loss = CrossEntropyLoss::forward(&logits, targets).item();
-
-        let grad = CrossEntropyLoss::backward(&logits, targets);
+        let (ce_loss, grad) = self.cross_entropy_loss_grad(&logits, targets);
         let _model_grad = self.model.backward(&grad);
+        self.grad_logits_buf = grad.into_data();
 
         let aux_loss = self.model.total_aux_loss(self.config.aux_loss_weight);
         let total_loss = ce_loss + aux_loss;

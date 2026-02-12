@@ -249,6 +249,8 @@ class AdamWState:
         """Initialize optimizer state."""
         self.m = np.zeros(shape, dtype=np.float32)  # First moment (mean of gradients)
         self.v = np.zeros(shape, dtype=np.float32)  # Second moment (mean of squared gradients)
+        # Scratch buffer reused in every optimizer step to avoid temporary arrays.
+        self.tmp = np.zeros(shape, dtype=np.float32)
 
 
 class Trainer:
@@ -268,8 +270,24 @@ class Trainer:
         self.config = config
         self.step = 0
 
+        # Parameters are static after model construction; cache once.
+        self.params = model.parameters()
         # One AdamW state per parameter tensor
-        self.states = [AdamWState(p.shape) for p in model.parameters()]
+        self.states = [AdamWState(p.shape) for p in self.params]
+
+        # Reusable buffers for cross-entropy (shape: [num_tokens, vocab_size]).
+        self._loss_probs: np.ndarray | None = None
+        self._loss_row_idx: np.ndarray | None = None
+
+    def _ensure_loss_buffers(
+        self, num_tokens: int, vocab_size: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Get reusable loss buffers sized for the current batch."""
+        if self._loss_probs is None or self._loss_probs.shape != (num_tokens, vocab_size):
+            self._loss_probs = np.empty((num_tokens, vocab_size), dtype=np.float32)
+        if self._loss_row_idx is None or self._loss_row_idx.shape[0] != num_tokens:
+            self._loss_row_idx = np.arange(num_tokens, dtype=np.int64)
+        return self._loss_probs, self._loss_row_idx
 
     def get_lr(self) -> float:
         """Get current learning rate with warmup and cosine decay.
@@ -315,30 +333,36 @@ class Trainer:
 
         flat_logits = logits.data.reshape(-1, vocab_size)
         flat_targets = targets.data.reshape(-1).astype(np.int64)
+        num_tokens = batch * seq_len
 
-        # Numerically stable softmax: subtract max before exp
+        # Numerically stable softmax into reusable buffer:
+        # probs = exp(logits - max(logits)) / sum(exp(logits - max(logits)))
+        probs, row_idx = self._ensure_loss_buffers(num_tokens, vocab_size)
         max_logits = np.max(flat_logits, axis=-1, keepdims=True)
-        exp_logits = np.exp(flat_logits - max_logits)
-        probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+        np.subtract(flat_logits, max_logits, out=probs)
+        np.exp(probs, out=probs)
+        np.divide(probs, np.sum(probs, axis=-1, keepdims=True), out=probs)
 
         # Cross entropy: L = -mean(log(p[target]))
         # Clamp probs to avoid log(0)
-        num_tokens = batch * seq_len
-        log_probs = np.log(np.maximum(probs, 1e-12))
-        loss = -np.mean(
-            log_probs[np.arange(num_tokens), flat_targets]
-        )
+        loss = -np.mean(np.log(np.maximum(probs[row_idx, flat_targets], 1e-12)))
 
-        # Gradient: d_logits = (softmax(logits) - one_hot(targets)) / num_tokens
-        grad = probs.copy()
-        grad[np.arange(num_tokens), flat_targets] -= 1.0
-        grad /= num_tokens
+        # Gradient: d_logits = (softmax(logits) - one_hot(targets)) / num_tokens.
+        # Reuse probs in-place to avoid a full-size copy.
+        probs[row_idx, flat_targets] -= 1.0
+        probs /= num_tokens
 
-        grad = grad.reshape((batch, seq_len, vocab_size))
+        grad = probs.reshape((batch, seq_len, vocab_size))
         return float(loss), Tensor.from_numpy(grad)
 
     def _adamw_step(
-        self, param: Tensor, grad: np.ndarray, state: AdamWState
+        self,
+        param: Tensor,
+        grad: np.ndarray,
+        state: AdamWState,
+        lr: float,
+        bias_c1_inv: float,
+        bias_c2_inv: float,
     ) -> None:
         """Perform AdamW optimizer step (in-place).
 
@@ -352,22 +376,36 @@ class Trainer:
         Note: weight decay is decoupled (applied to w directly, not to m_hat).
         This is the key difference between AdamW and L2-regularized Adam.
         """
-        lr = self.get_lr()
-        t = self.step  # step is already 1-indexed (incremented before update)
+        m = state.m
+        v = state.v
+        tmp = state.tmp
 
-        # Update moments
-        state.m = self.config.beta1 * state.m + (1 - self.config.beta1) * grad
-        state.v = self.config.beta2 * state.v + (1 - self.config.beta2) * (grad**2)
+        # Update moments (in-place):
+        # m = beta1 * m + (1 - beta1) * grad
+        np.multiply(grad, (1.0 - self.config.beta1), out=tmp)
+        np.multiply(m, self.config.beta1, out=m)
+        np.add(m, tmp, out=m)
 
-        # Bias correction compensates for zero-initialization of m and v
-        m_hat = state.m / (1 - self.config.beta1**t)
-        v_hat = state.v / (1 - self.config.beta2**t)
+        # v = beta2 * v + (1 - beta2) * grad^2
+        np.multiply(grad, grad, out=tmp)
+        np.multiply(tmp, (1.0 - self.config.beta2), out=tmp)
+        np.multiply(v, self.config.beta2, out=v)
+        np.add(v, tmp, out=v)
 
-        # Parameter update: Adam term + decoupled weight decay
-        param._data -= lr * (
-            m_hat / (np.sqrt(v_hat) + self.config.eps)
-            + self.config.weight_decay * param._data
-        )
+        # Build inv_denom = 1 / (sqrt(v_hat) + eps) in tmp.
+        np.multiply(v, bias_c2_inv, out=tmp)
+        np.sqrt(tmp, out=tmp)
+        tmp += self.config.eps
+        np.reciprocal(tmp, out=tmp)
+
+        # tmp = m_hat / (sqrt(v_hat) + eps), where m_hat = m * bias_c1_inv
+        np.multiply(m, tmp, out=tmp)
+        np.multiply(tmp, bias_c1_inv, out=tmp)
+
+        # Decoupled weight decay + Adam update (both in-place on parameter data).
+        if self.config.weight_decay != 0.0:
+            param._data *= (1.0 - lr * self.config.weight_decay)
+        param._data -= lr * tmp
 
     def train_step(self, input_ids: Tensor, targets: Tensor) -> float:
         """Perform single training step.
@@ -393,7 +431,7 @@ class Trainer:
         self.step += 1
 
         # Zero gradients before forward/backward
-        params = self.model.parameters()
+        params = self.params
         for param in params:
             param._grad = None
 
@@ -420,22 +458,25 @@ class Trainer:
                     total_norm_sq += float(np.sum(param._grad ** 2))
             global_norm = np.sqrt(total_norm_sq)
 
-            # Compute clip coefficient: if global_norm > clip_norm, scale down
+            # If needed, scale all gradients in-place once (Rust-style).
             if global_norm > clip_norm:
                 clip_coeff = clip_norm / (global_norm + 1e-12)
-            else:
-                clip_coeff = 1.0
-        else:
-            clip_coeff = 1.0
+                for param in params:
+                    if param._grad is not None:
+                        param._grad *= clip_coeff
 
-        # AdamW update using actual per-parameter gradients
+        # Compute step-wise constants once (instead of per parameter).
+        lr = self.get_lr()
+        beta1_pow_t = self.config.beta1**self.step
+        beta2_pow_t = self.config.beta2**self.step
+        bias_c1_inv = 1.0 / max(1.0 - beta1_pow_t, 1e-12)
+        bias_c2_inv = 1.0 / max(1.0 - beta2_pow_t, 1e-12)
+
+        # AdamW update
         for param, state in zip(params, self.states):
-            if param._grad is not None:
-                grad = param._grad * clip_coeff
-            else:
-                # Parameters without gradient (shouldn't happen after full backward)
-                grad = np.zeros(param.shape, dtype=np.float32)
-            self._adamw_step(param, grad, state)
+            if param._grad is None:
+                continue
+            self._adamw_step(param, param._grad, state, lr, bias_c1_inv, bias_c2_inv)
 
         return total_loss
 

@@ -9,13 +9,15 @@ package nn
 // reducing KV cache memory in inference.
 //
 // Full attention equation:
-//   scores = (Q @ K^T) / sqrt(d_k)
-//   weights = softmax(scores + causal_mask)
-//   output = weights @ V
+//
+//	scores = (Q @ K^T) / sqrt(d_k)
+//	weights = softmax(scores + causal_mask)
+//	output = weights @ V
 //
 // RoPE applies position-dependent rotation to Q and K before the dot product:
-//   [x0, x1] -> [x0*cos(theta) - x1*sin(theta), x0*sin(theta) + x1*cos(theta)]
-//   where theta_i = pos / base^(2i/d_head)
+//
+//	[x0, x1] -> [x0*cos(theta) - x1*sin(theta), x0*sin(theta) + x1*cos(theta)]
+//	where theta_i = pos / base^(2i/d_head)
 type MQAttention struct {
 	wQ, wK, wV, wO            *Linear
 	nHeads, nKVHeads, headDim int
@@ -24,12 +26,16 @@ type MQAttention struct {
 	freqs                     []float32 // precomputed RoPE frequency bands
 	scoresBuf                 []float32 // reusable buffer for attention scores
 	attnOutBuf                []float32 // reusable buffer for attention output
+	gradQBuf                  []float32 // reusable Q gradient buffer
+	gradKBuf                  []float32 // reusable K gradient buffer
+	gradVBuf                  []float32 // reusable V gradient buffer
+	gradScoresBuf             []float32 // reusable attention-score gradient buffer
 	// Cached from forward pass for backward
-	lastInput       *Tensor     // input to attention
-	lastQ           *Tensor     // Q after RoPE [batch, seq, nHeads, headDim]
-	lastK           *Tensor     // K after RoPE [batch, seq, nKVHeads, headDim]
-	lastV           *Tensor     // V [batch, seq, nKVHeads, headDim]
-	lastAttnWeights []float32   // softmax weights [batch * nHeads * seq * seq]
+	lastInput       *Tensor   // input to attention
+	lastQ           *Tensor   // Q after RoPE [batch, seq, nHeads, headDim]
+	lastK           *Tensor   // K after RoPE [batch, seq, nKVHeads, headDim]
+	lastV           *Tensor   // V [batch, seq, nKVHeads, headDim]
+	lastAttnWeights []float32 // softmax weights [batch * nHeads * seq * seq]
 	lastBatch       int
 	lastSeqLen      int
 }
@@ -37,8 +43,9 @@ type MQAttention struct {
 // NewMQAttention creates a Multi-Query Attention layer.
 //
 // RoPE frequency computation:
-//   base' = base * alpha^(d_head / (d_head - 2))   (NTK-aware scaling if alpha > 1)
-//   freq_i = 1 / base'^(2i / d_head)               for i in [0, d_head/2)
+//
+//	base' = base * alpha^(d_head / (d_head - 2))   (NTK-aware scaling if alpha > 1)
+//	freq_i = 1 / base'^(2i / d_head)               for i in [0, d_head/2)
 func NewMQAttention(hiddenDim, nHeads, nKVHeads, headDim int, ropeBase, ropeAlpha float32) *MQAttention {
 	base := ropeBase
 	if ropeAlpha > 1.0 {
@@ -89,10 +96,11 @@ func (a *MQAttention) Forward(input *Tensor) *Tensor {
 
 	a.applyRoPE(q.DataPtr(), k.DataPtr(), batch, seqLen, a.nHeads, a.nKVHeads)
 
-	// Cache Q, K, V after RoPE for backward pass
-	a.lastQ = q.Clone()
-	a.lastK = k.Clone()
-	a.lastV = v.Clone()
+	// Cache Q, K, V after RoPE for backward pass.
+	// These tensors are fresh forward outputs and not mutated afterward.
+	a.lastQ = q
+	a.lastK = k
+	a.lastV = v
 
 	// Reuse attention output buffer to avoid allocation per forward pass.
 	outLen := batch * seqLen * a.nHeads * a.headDim
@@ -203,13 +211,43 @@ func (a *MQAttention) Backward(gradOutput *Tensor) *Tensor {
 	kData := a.lastK.DataPtr()
 	vData := a.lastV.DataPtr()
 
-	// Allocate gradient tensors for Q, K, V (zero-initialized)
-	gradQ := make([]float32, batch*seqLen*a.nHeads*a.headDim)
-	gradK := make([]float32, batch*seqLen*a.nKVHeads*a.headDim)
-	gradV := make([]float32, batch*seqLen*a.nKVHeads*a.headDim)
+	// Reuse gradient buffers across backward calls to reduce allocation churn.
+	gradQLen := batch * seqLen * a.nHeads * a.headDim
+	if cap(a.gradQBuf) >= gradQLen {
+		a.gradQBuf = a.gradQBuf[:gradQLen]
+	} else {
+		a.gradQBuf = make([]float32, gradQLen)
+	}
+	gradQ := a.gradQBuf
 
-	// Scratch buffer for grad_scores per head [seqLen * seqLen]
-	gradScores := make([]float32, seqLen*seqLen)
+	gradKVLen := batch * seqLen * a.nKVHeads * a.headDim
+	if cap(a.gradKBuf) >= gradKVLen {
+		a.gradKBuf = a.gradKBuf[:gradKVLen]
+		for i := range a.gradKBuf {
+			a.gradKBuf[i] = 0
+		}
+	} else {
+		a.gradKBuf = make([]float32, gradKVLen)
+	}
+	gradK := a.gradKBuf
+	if cap(a.gradVBuf) >= gradKVLen {
+		a.gradVBuf = a.gradVBuf[:gradKVLen]
+		for i := range a.gradVBuf {
+			a.gradVBuf[i] = 0
+		}
+	} else {
+		a.gradVBuf = make([]float32, gradKVLen)
+	}
+	gradV := a.gradVBuf
+
+	// Scratch buffer for grad_scores per head [seqLen * seqLen].
+	gradScoresLen := seqLen * seqLen
+	if cap(a.gradScoresBuf) >= gradScoresLen {
+		a.gradScoresBuf = a.gradScoresBuf[:gradScoresLen]
+	} else {
+		a.gradScoresBuf = make([]float32, gradScoresLen)
+	}
+	gradScores := a.gradScoresBuf
 
 	hd := a.headDim
 	qStride := a.nHeads * hd
@@ -304,8 +342,10 @@ func (a *MQAttention) Backward(gradOutput *Tensor) *Tensor {
 	gradXK := a.wK.Backward(gradKTensor)
 	gradXV := a.wV.Backward(gradVTensor)
 
-	// Sum gradients from all projection paths
-	return gradXQ.Add(gradXK).Add(gradXV)
+	// Sum gradients from all projection paths in-place to avoid an extra tensor allocation.
+	gradXQ.AddInPlace(gradXK)
+	gradXQ.AddInPlace(gradXV)
+	return gradXQ
 }
 
 // Parameters returns all projection weights: Q, K, V, and O.
@@ -321,9 +361,10 @@ func (a *MQAttention) Parameters() []*Tensor {
 // applyRoPE applies Rotary Position Embeddings in-place to Q and K tensors.
 //
 // RoPE rotates consecutive pairs of dimensions by a position-dependent angle:
-//   theta_i = position * freq_i
-//   [x_{2i}, x_{2i+1}] -> [x_{2i}*cos(theta) - x_{2i+1}*sin(theta),
-//                           x_{2i}*sin(theta) + x_{2i+1}*cos(theta)]
+//
+//	theta_i = position * freq_i
+//	[x_{2i}, x_{2i+1}] -> [x_{2i}*cos(theta) - x_{2i+1}*sin(theta),
+//	                        x_{2i}*sin(theta) + x_{2i+1}*cos(theta)]
 //
 // This encodes relative position information directly into the Q/K vectors
 // so that the dot product Q_i . K_j depends on (i - j), not absolute positions.

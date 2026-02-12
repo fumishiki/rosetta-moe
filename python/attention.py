@@ -55,6 +55,10 @@ class MQAttention:
         # Invalidated when seq_len changes.
         self._cached_mask: np.ndarray | None = None
         self._cached_mask_len: int = 0
+        # RoPE trig cache for fixed seq_len workloads.
+        self._cached_rope_cos: np.ndarray | None = None
+        self._cached_rope_sin: np.ndarray | None = None
+        self._cached_rope_len: int = 0
 
         # KV head expansion indices — cached to avoid recomputation per forward call
         self._kv_indices = np.arange(self.n_heads) % self.n_kv_heads
@@ -92,15 +96,17 @@ class MQAttention:
         This encodes absolute position through relative-position-aware
         dot products: q_m . k_n depends only on (m - n).
         """
-        freqs = self._compute_rope_freqs(seq_len)
-
-        # angles[pos, i] = pos * freq_i   shape: [seq_len, head_dim/2]
-        positions = np.arange(seq_len, dtype=np.float32)
-        angles = np.outer(positions, freqs)
-
-        # Broadcast to [1, seq_len, 1, half_dim] for batched Q/K
-        cos_vals = np.cos(angles)[None, :, None, :]
-        sin_vals = np.sin(angles)[None, :, None, :]
+        if self._cached_rope_len != seq_len:
+            freqs = self._compute_rope_freqs(seq_len)
+            # angles[pos, i] = pos * freq_i   shape: [seq_len, head_dim/2]
+            positions = np.arange(seq_len, dtype=np.float32)
+            angles = np.outer(positions, freqs)
+            # Broadcast to [1, seq_len, 1, half_dim] for batched Q/K
+            self._cached_rope_cos = np.cos(angles)[None, :, None, :]
+            self._cached_rope_sin = np.sin(angles)[None, :, None, :]
+            self._cached_rope_len = seq_len
+        cos_vals = self._cached_rope_cos
+        sin_vals = self._cached_rope_sin
 
         # Split even/odd dims: q is [batch, seq, heads, head_dim]
         q_even = q[:, :, :, 0::2]
@@ -178,9 +184,10 @@ class MQAttention:
 
         # Numerically stable softmax: subtract max before exp to prevent overflow
         # Softmax: p_i = exp(s_i - max(s)) / sum_j(exp(s_j - max(s)))
-        shifted = scores - np.max(scores, axis=-1, keepdims=True)
-        exp_vals = np.exp(shifted)
-        attn_weights = exp_vals / np.sum(exp_vals, axis=-1, keepdims=True)
+        np.subtract(scores, np.max(scores, axis=-1, keepdims=True), out=scores)
+        np.exp(scores, out=scores)
+        np.divide(scores, np.sum(scores, axis=-1, keepdims=True), out=scores)
+        attn_weights = scores
 
         # Store for backward pass
         self.last_attn_weights = attn_weights

@@ -15,8 +15,6 @@
 //! where f_e = fraction of tokens routed to expert e,
 //!       p_e = mean gate probability for expert e.
 
-use std::cell::RefCell;
-
 use crate::attention::MQAttention;
 use crate::config::Config;
 use crate::layers::{ExpertFFN, Layer, Linear, RMSNorm, collect_params, collect_params_mut};
@@ -29,6 +27,9 @@ use crate::tensor::{Shape, Tensor};
 pub struct Router {
     gate: Linear,
     n_experts: usize,
+    probs_buf: Vec<f32>,
+    indices_buf: Vec<Vec<usize>>,
+    selected_buf: Vec<bool>,
 }
 
 impl Router {
@@ -36,6 +37,9 @@ impl Router {
         Self {
             gate: Linear::new(hidden_dim, n_experts),
             n_experts,
+            probs_buf: Vec::new(),
+            indices_buf: Vec::new(),
+            selected_buf: vec![false; n_experts],
         }
     }
 
@@ -49,21 +53,40 @@ impl Router {
     /// Routing: probs = softmax(Gate(x)), select top-k, renormalize selected weights.
     /// Uses greedy top-k selection (O(K*E) per token, no sort allocation) matching Go.
     pub fn route(&mut self, input: &Tensor, top_k: usize) -> (Vec<Vec<usize>>, Tensor, Vec<f32>) {
-        // Gate logits -> softmax -> per-expert probabilities
-        // Use softmax_into to avoid allocating a new tensor
+        // Gate logits -> per-expert probabilities.
+        // Reuse a flat probability buffer to avoid per-step tensor allocation.
         let gate_out = self.gate.forward(input);
-        let mut probs = Tensor::zeros(gate_out.shape().clone(), gate_out.dtype());
-        if let Err(e) = gate_out.softmax_into(&mut probs) {
-            panic!("{e}");
-        }
         let (batch, seq_len, _) = input.dims_3d();
         let batch_seq = batch * seq_len;
-        let probs_data = probs.data();
+        let logits_data = gate_out.data();
+        let probs_len = batch_seq * self.n_experts;
 
-        let mut all_indices = Vec::with_capacity(batch_seq);
+        let mut probs = std::mem::take(&mut self.probs_buf);
+        probs.resize(probs_len, 0.0);
+        let probs_data = &mut probs[..probs_len];
+        for t in 0..batch_seq {
+            let start = t * self.n_experts;
+            crate::tensor::softmax_into_slice(
+                &logits_data[start..start + self.n_experts],
+                &mut probs_data[start..start + self.n_experts],
+            );
+        }
+
+        let mut all_indices = std::mem::take(&mut self.indices_buf);
+        if all_indices.len() != batch_seq {
+            all_indices.resize_with(batch_seq, Vec::new);
+        }
+        for idxs in &mut all_indices {
+            if idxs.len() != top_k {
+                idxs.resize(top_k, 0);
+            }
+        }
         let mut all_weights = vec![0.0; batch_seq * top_k];
-        // Reusable selected flags -- avoids per-token allocation (matches Go pattern)
-        let mut selected = vec![false; self.n_experts];
+        // Reusable selected flags -- avoids per-token allocation (matches Go pattern).
+        let selected = &mut self.selected_buf;
+        if selected.len() < self.n_experts {
+            selected.resize(self.n_experts, false);
+        }
 
         for t in 0..batch_seq {
             let row = &probs_data[t * self.n_experts..(t + 1) * self.n_experts];
@@ -71,7 +94,6 @@ impl Router {
             for s in selected.iter_mut() {
                 *s = false;
             }
-            let mut idxs = Vec::with_capacity(top_k);
             for k in 0..top_k {
                 let mut best_idx = 0;
                 let mut best_val = f32::NEG_INFINITY;
@@ -82,7 +104,7 @@ impl Router {
                     }
                 }
                 selected[best_idx] = true;
-                idxs.push(best_idx);
+                all_indices[t][k] = best_idx;
                 all_weights[t * top_k + k] = best_val;
             }
             // Renormalize selected weights so they sum to 1
@@ -94,13 +116,12 @@ impl Router {
             for k in 0..top_k {
                 all_weights[t * top_k + k] *= inv;
             }
-            all_indices.push(idxs);
         }
 
         (
             all_indices,
             Tensor::from_vec(all_weights, Shape::new(&[batch_seq, top_k])),
-            probs_data.to_vec(),
+            probs,
         )
     }
 }
@@ -124,18 +145,15 @@ pub struct MoELayer {
     router: Router,
     experts: Vec<ExpertFFN>,
     top_k: usize,
-    // RefCell: forward() needs &self (Layer trait) but must store route data.
-    // Single-threaded access makes this safe.
-    last_route: RefCell<Option<RouteData>>,
+    /// Cached routing data for aux loss.
+    last_route: Option<RouteData>,
     /// Cached forward data for backward
-    last_input: Option<Vec<f32>>,
     last_hidden: usize,
     last_batch_shape: Option<(usize, usize)>,
-    last_indices: Option<Vec<Vec<usize>>>,
+    /// Reused expert token groups from forward, consumed by backward.
+    expert_tokens_buf: Vec<Vec<usize>>,
+    expert_weight_idx_buf: Vec<Vec<usize>>,
     last_weights: Option<Vec<f32>>,
-    /// Pre-allocated backward scratch buffers (reused across steps)
-    token_indices_buf: Vec<usize>,
-    weight_slots_buf: Vec<usize>,
     inference_mode: bool,
 }
 
@@ -144,18 +162,18 @@ impl MoELayer {
         let experts = (0..config.n_experts)
             .map(|_| ExpertFFN::new(config.hidden_dim, config.ffn_dim))
             .collect();
+        let expert_tokens_buf = (0..config.n_experts).map(|_| Vec::new()).collect();
+        let expert_weight_idx_buf = (0..config.n_experts).map(|_| Vec::new()).collect();
         Self {
             router: Router::new(config.hidden_dim, config.n_experts),
             experts,
             top_k: config.top_k_experts,
-            last_route: RefCell::new(None),
-            last_input: None,
+            last_route: None,
             last_hidden: 0,
             last_batch_shape: None,
-            last_indices: None,
+            expert_tokens_buf,
+            expert_weight_idx_buf,
             last_weights: None,
-            token_indices_buf: Vec::new(),
-            weight_slots_buf: Vec::new(),
             inference_mode: false,
         }
     }
@@ -170,8 +188,7 @@ impl MoELayer {
     /// Minimizing L_aux pushes f_e and p_e toward 1/N (uniform distribution),
     /// preventing expert collapse where a few experts get all the traffic.
     pub fn aux_loss(&self, alpha: f32) -> f32 {
-        let guard = self.last_route.borrow();
-        let data = match guard.as_ref() {
+        let data = match self.last_route.as_ref() {
             Some(d) => d,
             None => return 0.0,
         };
@@ -223,19 +240,27 @@ impl Layer for MoELayer {
 
         // Build inverted index: expert_id -> list of (token_index, weight_slot)
         let n_experts = self.router.n_experts;
-        let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
-        let mut expert_weight_idx: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
+        if self.expert_tokens_buf.len() != n_experts {
+            self.expert_tokens_buf.resize_with(n_experts, Vec::new);
+        }
+        if self.expert_weight_idx_buf.len() != n_experts {
+            self.expert_weight_idx_buf.resize_with(n_experts, Vec::new);
+        }
+        for e in 0..n_experts {
+            self.expert_tokens_buf[e].clear();
+            self.expert_weight_idx_buf[e].clear();
+        }
 
         for t in 0..batch_seq {
             for (k, &expert_idx) in indices[t].iter().enumerate() {
-                expert_tokens[expert_idx].push(t);
-                expert_weight_idx[expert_idx].push(k);
+                self.expert_tokens_buf[expert_idx].push(t);
+                self.expert_weight_idx_buf[expert_idx].push(k);
             }
         }
 
         // Process each expert's assigned tokens as a single batch
         for e_idx in 0..n_experts {
-            let tokens = &expert_tokens[e_idx];
+            let tokens = &self.expert_tokens_buf[e_idx];
             if tokens.is_empty() {
                 continue;
             }
@@ -255,7 +280,7 @@ impl Layer for MoELayer {
 
             // Scatter-add: weighted expert output back to each token's position
             for (i, &t) in tokens.iter().enumerate() {
-                let k = expert_weight_idx[e_idx][i];
+                let k = self.expert_weight_idx_buf[e_idx][i];
                 let alpha = w[t * self.top_k + k];
                 let t_off = t * hidden;
                 let e_off = i * hidden;
@@ -266,19 +291,21 @@ impl Layer for MoELayer {
         }
 
         if !self.inference_mode {
-            self.last_input = Some(input_data.to_vec());
             self.last_hidden = hidden;
             self.last_batch_shape = Some((batch, seq_len));
-            self.last_indices = Some(indices.clone());
-            self.last_weights = Some(w.to_vec());
-
-            *self.last_route.borrow_mut() = Some(RouteData {
+            self.last_weights = Some(weights.into_data());
+            self.last_route = Some(RouteData {
                 gate_probs,
                 indices,
                 batch_seq,
                 n_experts,
                 top_k: self.top_k,
             });
+        } else {
+            self.router.probs_buf = gate_probs;
+            self.router.indices_buf = indices;
+            self.last_route = None;
+            self.last_weights = None;
         }
 
         Tensor::from_vec(out, Shape::new(&[batch, seq_len, hidden]))
@@ -293,33 +320,23 @@ impl Layer for MoELayer {
     fn backward(&mut self, grad_output: &Tensor) -> Tensor {
         let (batch, seq_len) = self.last_batch_shape.unwrap_or((1, 1));
         let hidden = self.last_hidden;
-        let batch_seq = batch * seq_len;
 
         let flat_grad = grad_output.data();
-        let indices = self.last_indices.take().unwrap_or_default();
+        let route_data = self.last_route.take();
         let weights = self.last_weights.take().unwrap_or_default();
-        let flat_x = self.last_input.take().unwrap_or_default();
+        if let Some(route) = route_data {
+            self.router.probs_buf = route.gate_probs;
+            self.router.indices_buf = route.indices;
+        }
 
+        let batch_seq = batch * seq_len;
         let mut grad_input = vec![0.0f32; batch_seq * hidden];
+        let expert_tokens = &self.expert_tokens_buf;
+        let expert_weight_idx = &self.expert_weight_idx_buf;
 
-        let n_experts = self.router.n_experts;
-
-        // Take buffers out of self to avoid borrow conflicts
-        let mut token_indices = std::mem::take(&mut self.token_indices_buf);
-        let mut weight_slots = std::mem::take(&mut self.weight_slots_buf);
-
-        for expert_idx in 0..n_experts {
-            // Find tokens assigned to this expert and their weight slots (reuse buffers)
-            token_indices.clear();
-            weight_slots.clear();
-            for t in 0..batch_seq {
-                for (k, &e) in indices[t].iter().enumerate() {
-                    if e == expert_idx {
-                        token_indices.push(t);
-                        weight_slots.push(k);
-                    }
-                }
-            }
+        for expert_idx in 0..self.router.n_experts {
+            let token_indices = &expert_tokens[expert_idx];
+            let weight_slots = &expert_weight_idx[expert_idx];
             if token_indices.is_empty() {
                 continue;
             }
@@ -338,25 +355,8 @@ impl Layer for MoELayer {
             }
             let expert_grad = Tensor::from_vec(expert_grad_data, Shape::new(&[n_tok, 1, hidden]));
 
-            // Restore expert's cached input (expert forward saw gathered tokens)
-            let mut expert_input_data = vec![0.0f32; n_tok * hidden];
-            for (i, &t) in token_indices.iter().enumerate() {
-                let src = &flat_x[t * hidden..(t + 1) * hidden];
-                expert_input_data[i * hidden..(i + 1) * hidden].copy_from_slice(src);
-            }
-
-            // Restore cached input for the expert's sub-layers
-            // Only store once on expert; SwiGLU backward handles sub-layer forwarding
-            let expert = &mut self.experts[expert_idx];
-            expert.last_input = Some(expert_input_data);
-            expert.last_input_shape = Some(Shape::new(&[n_tok, 1, hidden]));
-            // gate_proj and up_proj last_input will be set by SwiGLU backward
-            // from expert.last_input (avoids 2 clones)
-            expert.gate_proj.last_batch = n_tok;
-            expert.up_proj.last_batch = n_tok;
-
             // Backward through expert (accumulates weight gradients)
-            let grad_expert_input = expert.backward(&expert_grad);
+            let grad_expert_input = self.experts[expert_idx].backward(&expert_grad);
             let ge_data = grad_expert_input.data();
 
             // Scatter-add input gradient back to token positions
@@ -368,10 +368,6 @@ impl Layer for MoELayer {
                 }
             }
         }
-
-        // Stash reusable buffers back
-        self.token_indices_buf = token_indices;
-        self.weight_slots_buf = weight_slots;
 
         Tensor::from_vec(grad_input, Shape::new(&[batch, seq_len, hidden]))
     }

@@ -10,9 +10,10 @@ package nn
 // Router selects the top-K experts for each token via a learned gate.
 //
 // Gating:
-//   gate_probs = softmax(W_gate @ x)    -- probability over all experts
-//   top_k_indices = argmax_k(gate_probs)
-//   top_k_weights = normalize(gate_probs[top_k_indices])
+//
+//	gate_probs = softmax(W_gate @ x)    -- probability over all experts
+//	top_k_indices = argmax_k(gate_probs)
+//	top_k_weights = normalize(gate_probs[top_k_indices])
 //
 // The top-k weights are renormalized to sum to 1 so the MoE output is a
 // proper weighted average of expert outputs.
@@ -25,9 +26,11 @@ type Router struct {
 	lastIndices  [][]int
 	lastGateProb *Tensor // cached for auxiliary load-balancing loss
 	// Reusable buffers to reduce per-forward allocation pressure.
-	softmaxBuf *Tensor  // reusable softmax output
-	selected   []bool   // reusable per-token selection flags
-	flatIdx    []int    // flat index backing store for lastIndices
+	softmaxBuf  *Tensor // reusable softmax output
+	selected    []bool  // reusable per-token selection flags
+	flatIdx     []int   // flat index backing store for lastIndices
+	auxCountBuf []float32
+	auxProbBuf  []float32
 }
 
 // NewRouter creates a top-K expert router.
@@ -71,13 +74,14 @@ func (r *Router) Forward(input *Tensor) (*Tensor, [][]int) {
 	totalIdx := numTokens * r.topK
 	if cap(r.flatIdx) >= totalIdx {
 		r.flatIdx = r.flatIdx[:totalIdx]
-		for i := range r.flatIdx {
-			r.flatIdx[i] = 0
-		}
 	} else {
 		r.flatIdx = make([]int, totalIdx)
 	}
-	r.lastIndices = make([][]int, numTokens)
+	if cap(r.lastIndices) >= numTokens {
+		r.lastIndices = r.lastIndices[:numTokens]
+	} else {
+		r.lastIndices = make([][]int, numTokens)
+	}
 	for t := 0; t < numTokens; t++ {
 		r.lastIndices[t] = r.flatIdx[t*r.topK : (t+1)*r.topK]
 	}
@@ -121,11 +125,12 @@ func (r *Router) Parameters() []*Tensor { return r.gate.Parameters() }
 
 // ComputeAuxLoss computes the load-balancing auxiliary loss (Switch Transformer).
 //
-//   aux_loss = alpha * N_experts * sum_e(f_e * P_e)
+//	aux_loss = alpha * N_experts * sum_e(f_e * P_e)
 //
 // where:
-//   f_e = fraction of tokens routed to expert e
-//   P_e = mean gate probability for expert e
+//
+//	f_e = fraction of tokens routed to expert e
+//	P_e = mean gate probability for expert e
 //
 // This encourages uniform expert utilization. Multiplied by alpha and N_experts
 // so the loss scale is independent of expert count.
@@ -136,8 +141,24 @@ func (r *Router) ComputeAuxLoss(alpha float32) float32 {
 	probsData := r.lastGateProb.DataPtr()
 	numTokens := r.lastGateProb.Shape().At(0)
 
-	expertCounts := make([]float32, r.nExperts)
-	expertProbs := make([]float32, r.nExperts)
+	if cap(r.auxCountBuf) >= r.nExperts {
+		r.auxCountBuf = r.auxCountBuf[:r.nExperts]
+		for i := range r.auxCountBuf {
+			r.auxCountBuf[i] = 0
+		}
+	} else {
+		r.auxCountBuf = make([]float32, r.nExperts)
+	}
+	if cap(r.auxProbBuf) >= r.nExperts {
+		r.auxProbBuf = r.auxProbBuf[:r.nExperts]
+		for i := range r.auxProbBuf {
+			r.auxProbBuf[i] = 0
+		}
+	} else {
+		r.auxProbBuf = make([]float32, r.nExperts)
+	}
+	expertCounts := r.auxCountBuf
+	expertProbs := r.auxProbBuf
 
 	for t := 0; t < numTokens; t++ {
 		for k := 0; k < r.topK; k++ {
@@ -162,7 +183,7 @@ func (r *Router) ComputeAuxLoss(alpha float32) float32 {
 
 // MoELayer implements token-level Mixture of Experts.
 //
-//   output = sum_k(weight_k * Expert_k(x))   for top-k selected experts
+//	output = sum_k(weight_k * Expert_k(x))   for top-k selected experts
 //
 // Each expert is an independent SwiGLU FFN. The router selects which experts
 // process each token; only the top-K experts are evaluated (sparse activation).
@@ -173,12 +194,18 @@ type MoELayer struct {
 	nExperts  int
 	topK      int
 	outBuf    []float32 // reusable output buffer for forward pass
+	gradInBuf []float32 // reusable input-gradient buffer for backward
+	// Per-expert reusable buffers. Each expert keeps its own storage because
+	// expert.Forward caches input tensors for backward.
+	expertBatchBuf [][]float32
+	expertGradBuf  [][]float32
 	// Cached from forward for backward
-	lastFlatX        []float32
-	lastWeights      []float32 // [numTokens * topK]
-	lastIndices      [][]int
-	lastLeadingDims  []int
-	lastNumTokens    int
+	lastWeights         []float32 // [numTokens * topK]
+	lastIndices         [][]int
+	lastLeadingDims     []int
+	lastNumTokens       int
+	lastExpertTokens    [][]int
+	lastExpertWeightIdx [][]int
 }
 
 // NewMoELayer creates a MoE layer with nExperts independent SwiGLU experts.
@@ -188,11 +215,13 @@ func NewMoELayer(hiddenDim, ffnDim, nExperts, topK int) *MoELayer {
 		experts[i] = NewSwiGLU(hiddenDim, ffnDim)
 	}
 	return &MoELayer{
-		router:    NewRouter(hiddenDim, nExperts, topK),
-		experts:   experts,
-		hiddenDim: hiddenDim,
-		nExperts:  nExperts,
-		topK:      topK,
+		router:         NewRouter(hiddenDim, nExperts, topK),
+		experts:        experts,
+		hiddenDim:      hiddenDim,
+		nExperts:       nExperts,
+		topK:           topK,
+		expertBatchBuf: make([][]float32, nExperts),
+		expertGradBuf:  make([][]float32, nExperts),
 	}
 }
 
@@ -213,11 +242,8 @@ func (m *MoELayer) Forward(input *Tensor) *Tensor {
 	flatInput := input.Reshape(NewShape(numTokens, m.hiddenDim))
 	flatData := flatInput.DataPtr()
 
-	// Cache for backward
-	m.lastFlatX = make([]float32, len(flatData))
-	copy(m.lastFlatX, flatData)
-	m.lastWeights = make([]float32, len(weights.DataPtr()))
-	copy(m.lastWeights, weights.DataPtr())
+	// Cache for backward (referencing forward-time buffers; valid until next forward).
+	m.lastWeights = weights.DataPtr()
 	m.lastIndices = indices
 	m.lastLeadingDims = cloneInts(leadingDims)
 	m.lastNumTokens = numTokens
@@ -239,11 +265,25 @@ func (m *MoELayer) Forward(input *Tensor) *Tensor {
 	// Build inverted index: expert_id -> list of (token_index, weight_slot)
 	// Pre-allocate with estimated capacity to avoid repeated grow+copy.
 	avgTokensPerExpert := (numTokens*m.topK)/m.nExperts + 1
-	expertTokens := make([][]int, m.nExperts)
-	expertWeightIdx := make([][]int, m.nExperts)
-	for i := range expertTokens {
-		expertTokens[i] = make([]int, 0, avgTokensPerExpert)
-		expertWeightIdx[i] = make([]int, 0, avgTokensPerExpert)
+	if len(m.lastExpertTokens) != m.nExperts {
+		m.lastExpertTokens = make([][]int, m.nExperts)
+	}
+	if len(m.lastExpertWeightIdx) != m.nExperts {
+		m.lastExpertWeightIdx = make([][]int, m.nExperts)
+	}
+	expertTokens := m.lastExpertTokens
+	expertWeightIdx := m.lastExpertWeightIdx
+	for i := 0; i < m.nExperts; i++ {
+		if cap(expertTokens[i]) >= avgTokensPerExpert {
+			expertTokens[i] = expertTokens[i][:0]
+		} else {
+			expertTokens[i] = make([]int, 0, avgTokensPerExpert)
+		}
+		if cap(expertWeightIdx[i]) >= avgTokensPerExpert {
+			expertWeightIdx[i] = expertWeightIdx[i][:0]
+		} else {
+			expertWeightIdx[i] = make([]int, 0, avgTokensPerExpert)
+		}
 	}
 	for t := 0; t < numTokens; t++ {
 		for k := 0; k < m.topK; k++ {
@@ -252,6 +292,8 @@ func (m *MoELayer) Forward(input *Tensor) *Tensor {
 			expertWeightIdx[eIdx] = append(expertWeightIdx[eIdx], k)
 		}
 	}
+	m.lastExpertTokens = expertTokens
+	m.lastExpertWeightIdx = expertWeightIdx
 
 	// Process each expert's assigned tokens as a single batch.
 	for eIdx := 0; eIdx < m.nExperts; eIdx++ {
@@ -260,12 +302,18 @@ func (m *MoELayer) Forward(input *Tensor) *Tensor {
 			continue
 		}
 
-		// Gather: collect assigned token vectors into a contiguous batch
-		batchData := make([]float32, len(tokens)*m.hiddenDim)
+		// Gather: collect assigned token vectors into a contiguous batch.
+		need := len(tokens) * m.hiddenDim
+		batchData := m.expertBatchBuf[eIdx]
+		if cap(batchData) >= need {
+			batchData = batchData[:need]
+		} else {
+			batchData = make([]float32, need)
+		}
+		m.expertBatchBuf[eIdx] = batchData
 		for i, t := range tokens {
 			copy(batchData[i*m.hiddenDim:], flatData[t*m.hiddenDim:(t+1)*m.hiddenDim])
 		}
-		// Use FromSliceNoCopy: batchData is freshly allocated, no need to copy again.
 		batchInput := FromSliceNoCopy(batchData, NewShape(len(tokens), m.hiddenDim))
 		expertOut := m.experts[eIdx].Forward(batchInput)
 		eOutData := expertOut.DataPtr()
@@ -295,24 +343,18 @@ func (m *MoELayer) Backward(gradOutput *Tensor) *Tensor {
 	_, _, _ = splitLast(gradOutput.Shape().DimsRef())
 	flatGrad := gradOutput.Reshape(NewShape(numTokens, m.hiddenDim)).DataPtr()
 
-	gradInput := make([]float32, numTokens*m.hiddenDim)
-
-	// Rebuild inverted index (same as forward)
-	avgTokensPerExpert := (numTokens*m.topK)/m.nExperts + 1
-	expertTokens := make([][]int, m.nExperts)
-	expertWeightIdx := make([][]int, m.nExperts)
-	for i := range expertTokens {
-		expertTokens[i] = make([]int, 0, avgTokensPerExpert)
-		expertWeightIdx[i] = make([]int, 0, avgTokensPerExpert)
-	}
-	for t := 0; t < numTokens; t++ {
-		for k := 0; k < m.topK; k++ {
-			eIdx := m.lastIndices[t][k]
-			expertTokens[eIdx] = append(expertTokens[eIdx], t)
-			expertWeightIdx[eIdx] = append(expertWeightIdx[eIdx], k)
+	gradLen := numTokens * m.hiddenDim
+	if cap(m.gradInBuf) >= gradLen {
+		m.gradInBuf = m.gradInBuf[:gradLen]
+		for i := range m.gradInBuf {
+			m.gradInBuf[i] = 0
 		}
+	} else {
+		m.gradInBuf = make([]float32, gradLen)
 	}
-
+	gradInput := m.gradInBuf
+	expertTokens := m.lastExpertTokens
+	expertWeightIdx := m.lastExpertWeightIdx
 	for eIdx := 0; eIdx < m.nExperts; eIdx++ {
 		tokens := expertTokens[eIdx]
 		if len(tokens) == 0 {
@@ -320,7 +362,14 @@ func (m *MoELayer) Backward(gradOutput *Tensor) *Tensor {
 		}
 
 		// Compute weighted grad for this expert: flat_grad[token] * weight
-		expertGradData := make([]float32, len(tokens)*m.hiddenDim)
+		need := len(tokens) * m.hiddenDim
+		expertGradData := m.expertGradBuf[eIdx]
+		if cap(expertGradData) >= need {
+			expertGradData = expertGradData[:need]
+		} else {
+			expertGradData = make([]float32, need)
+		}
+		m.expertGradBuf[eIdx] = expertGradData
 		for i, t := range tokens {
 			k := expertWeightIdx[eIdx][i]
 			w := m.lastWeights[t*m.topK+k]
@@ -332,19 +381,8 @@ func (m *MoELayer) Backward(gradOutput *Tensor) *Tensor {
 		}
 		expertGrad := FromSliceNoCopy(expertGradData, NewShape(len(tokens), m.hiddenDim))
 
-		// Set expert's cached input for backward
-		expertInputData := make([]float32, len(tokens)*m.hiddenDim)
-		for i, t := range tokens {
-			copy(expertInputData[i*m.hiddenDim:], m.lastFlatX[t*m.hiddenDim:(t+1)*m.hiddenDim])
-		}
-		expertInput := FromSliceNoCopy(expertInputData, NewShape(len(tokens), m.hiddenDim))
-
-		// Restore expert's lastInput for backward pass
-		m.experts[eIdx].lastInput = expertInput
-		m.experts[eIdx].wGate.lastInput = expertInput
-		m.experts[eIdx].wUp.lastInput = expertInput
-
 		// Backward through expert (accumulates weight gradients in SwiGLU sub-layers)
+		// Expert forward already cached its own lastInput/lastGate/lastUp.
 		gradExpertInput := m.experts[eIdx].Backward(expertGrad)
 		geData := gradExpertInput.DataPtr()
 

@@ -17,12 +17,12 @@ Rust, Go, Python, Julia — each implements the same MoE Transformer from scratc
 
 | | Forward | Train | T4 Inference | T4 Training | softmax | RSS |
 |---|---|---|---|---|---|---|
-| **Rust** | **0.57 ms** | 1.31 ms | **4,738 inf/s** | 1,309 trn/s | **1.83 us** | **20 MB** |
-| **Julia** | 0.61 ms | **1.00 ms** | 4,205 inf/s | **1,558 trn/s** | 4.83 us | 488 MB |
-| **Go** | 1.14 ms | 3.33 ms | 2,121 inf/s | 867 trn/s | 5.67 us | 32 MB |
-| **Python** | 2.37 ms | 10.03 ms | 1,898 inf/s | 503 trn/s | 16.2 us | 63 MB |
+| **Rust** | 0.60 ms | 1.29 ms | **4,579 inf/s** | 1,055 trn/s | **1.83 us** | **20 MB** |
+| **Julia** | **0.59 ms** | **0.99 ms** | 4,256 inf/s | **1,528 trn/s** | 4.83 us | 536 MB |
+| **Go** | 1.09 ms | 3.92 ms | 2,511 inf/s | 578 trn/s | 5.67 us | 33 MB |
+| **Python** | 1.76 ms | 6.43 ms | 2,229 inf/s | 792 trn/s | 15.40 us | 57 MB |
 
-Rust leads inference and kernels. Julia leads training. Both hit >37% of M1 AMX peak on matmul. At hidden=256, the forward gap already narrows from 4.2x to 1.9x.
+Rust leads T4 inference throughput and kernel softmax. Julia leads single-thread forward and training. Both hit ~600 GFLOPS on 64x64 matmul in this run. At hidden=256, forward spread narrows to 1.46x.
 
 <details>
 <summary>Parallel scaling detail</summary>
@@ -31,19 +31,19 @@ Rust leads inference and kernels. Julia leads training. Both hit >37% of M1 AMX 
 
 | | Julia | Rust | Go | Python |
 |---|---|---|---|---|
-| T1 | 1,458 inf/s | **1,742** | 874 | 768 |
-| T4 | 4,205 inf/s | **4,738** | 2,121 | 1,898 |
-| Speedup | **2.88x** | 2.72x | 2.43x | 2.47x |
+| T1 | 1,545 inf/s | **1,753** | 915 | 989 |
+| T4 | 4,256 inf/s | **4,579** | 2,511 | 2,229 |
+| Speedup | **2.75x** | 2.61x | 2.74x | 2.25x |
 
 ### Training (T4/T1)
 
 | | Julia | Rust | Go | Python |
 |---|---|---|---|---|
-| T1 | **943 trn/s** | 758 | 311 | 175 |
-| T4 | **1,558 trn/s** | 1,309 | 867 | 503 |
-| Speedup | 1.65x | 1.73x | 2.79x | **2.88x** |
+| T1 | **999 trn/s** | 743 | 309 | 298 |
+| T4 | **1,528 trn/s** | 1,055 | 578 | 792 |
+| Speedup | 1.53x | 1.42x | 1.87x | **2.66x** |
 
-Training scaling is lower because backward pass triples AMX bus transactions. [Full AMX analysis](docs/analysis-parallel-training.md)
+Training scaling is lower than inference for Rust/Julia because backward pass increases AMX bus pressure. [Full AMX analysis](docs/analysis-parallel-training.md)
 
 </details>
 
@@ -55,6 +55,7 @@ Full results with 22 scenarios across 5 axes: [`docs/bench-results.md`](docs/ben
 make test          # test all 4 languages
 make bench         # benchmark + summary table
 make convergence   # verify loss convergence
+make convergence-plots  # run each language + render loss SVGs
 ```
 
 <details>
@@ -75,11 +76,11 @@ cd julia && julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ..
 
 | Question | Finding |
 |----------|---------|
-| **Is GC actually a problem for ML?** | No. Go: 29M alloc/train, gc_throughput 0.996. Julia: 0 GC pauses. |
-| **Does BLAS FFI overhead matter?** | Rust/Julia both >37% M1 peak. Language only matters for non-BLAS code. |
-| **Rust vs Julia for ML?** | Rust leads inference (0.57ms). Julia leads training (1.00ms via broadcast fusion). |
+| **Is GC actually a problem for ML?** | Not in this run. All languages report gc_throughput ~= 1.000 in train-step scenario. |
+| **Does BLAS FFI overhead matter?** | Yes for tiny kernels. At 64x64 matmul, Rust/Julia/Go are close (~586-599 GF). Non-BLAS kernels dominate language gaps. |
+| **Rust vs Julia for ML?** | Julia leads single-thread forward/train (0.59ms / 0.99ms). Rust leads T4 inference throughput (4,579 inf/s). |
 | **Does column-major help?** | Yes for training. No for inference (Rust's optimization overcomes layout disadvantage). |
-| **Do language gaps persist at scale?** | Forward spread: 4.2x (h=64) → 1.9x (h=256). BLAS share grows, gap shrinks. |
+| **Do language gaps persist at scale?** | Forward spread: 2.97x (h=64) → 1.46x (h=256). Train spread: 6.46x → 3.94x. |
 
 ## What Makes This Different
 
@@ -97,11 +98,11 @@ cd julia && julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ..
 
 | Axis | What it isolates | Key finding |
 |------|-----------------|-------------|
-| **Memory** | Ownership vs GC vs RC under scaling | Rust 20MB/0.57ms fwd. Julia 0 GC forward + training (0 pauses, 0ns). Go 29M alloc/train, invisible GC (0.996) |
-| **Compiler** | BLAS dispatch + loop optimization | Rust/Julia both >37% M1 peak. Rust leads softmax (1.83us) and rmsnorm (3.38us) |
-| **Type System** | Dispatch overhead | Rust 0.57ms warm, Julia 0.61ms. Rust leads forward, Julia leads training |
-| **Parallel** | Thread scaling (inference + training) | Rust leads inference T4 (4,738 inf/s). Julia leads training T4 (1,558 trn/s). Training scaling limited by AMX contention |
-| **Scale** | Convergence at larger model | Forward spread: 4.2x (h=64) → 1.9x (h=256) |
+| **Memory** | Ownership vs GC vs RC under scaling | Rust has smallest RSS (~20MB). Julia/Rust keep train-step near 1ms; Go/Python higher alloc pressure and latency |
+| **Compiler** | BLAS dispatch + loop optimization | Rust leads softmax (1.83us). Julia leads rmsnorm among dynamic runtimes in this run |
+| **Type System** | Dispatch overhead | Warm dispatch: Julia 0.59ms, Rust 0.60ms, Go 1.09ms, Python 1.76ms |
+| **Parallel** | Thread scaling (inference + training) | Rust leads inference T4 (4,579 inf/s). Julia leads training T4 (1,528 trn/s) |
+| **Scale** | Convergence at larger model | Forward spread: 2.97x (h=64) → 1.46x (h=256) |
 
 ## Architecture
 
@@ -160,11 +161,11 @@ All matrix multiplications route through Apple Accelerate's `cblas_sgemm`, which
 ## Key Findings
 
 1. **BLAS levels the playing field.** All 4 languages hit the same AMX — the language only matters for non-BLAS code.
-2. **GC is not the enemy.** Go gc_throughput 0.985-1.000 across all scenarios. Julia: zero GC pauses on training.
-3. **Broadcast fusion > zero-alloc.** Julia's `@.` fused backward (1.00ms) beats Rust's hand-written zero-alloc backward (1.31ms).
-4. **AMX contention is the parallel ceiling.** Inference T4/T1: 2.4-2.9x. Training T4/T1: 1.7x (3x more AMX bus transactions).
-5. **Language gaps collapse at scale.** Forward spread: 4.2x (h=64) → 1.9x (h=256). BLAS share grows with model size.
-6. **RSS inversely correlates with ergonomics.** Rust 20MB (manual everything) → Julia 488MB (JIT buys dispatch + fusion + zero-GC).
+2. **GC was effectively invisible in this run.** Train-step `gc_throughput` is ~1.000 for all 4 languages.
+3. **Julia keeps the fastest train step.** 0.99ms vs Rust 1.29ms in h=64 mem-train scenario.
+4. **Rust keeps the strongest inference throughput.** 4,579 inf/s at T4.
+5. **Language gaps shrink at larger hidden sizes.** Forward spread drops to 1.46x at h=256.
+6. **RSS still diverges strongly.** Rust ~20MB vs Julia ~536MB in warm forward scenario.
 
 ## Why Julia Beats Rust at Training
 
@@ -341,10 +342,10 @@ The question this benchmark answers: what if the host language were fast enough 
 
 | Language | Forward h=64 | Forward h=256 | Train h=64 | Train h=256 |
 |----------|-------------|--------------|-----------|------------|
-| **Rust** | 0.56 ms | 2.91 ms | 1.44 ms | 16.90 ms |
-| **Julia** | 0.59 ms | 3.47 ms | 0.98 ms | 9.58 ms |
-| **Go** | 1.14 ms | 5.26 ms | 3.28 ms | 38.33 ms |
-| **Python** | 2.53 ms | 5.11 ms | 10.22 ms | 49.07 ms |
+| **Rust** | 0.60 ms | 3.71 ms | 1.29 ms | 19.71 ms |
+| **Julia** | 0.59 ms | 3.61 ms | 0.99 ms | 9.81 ms |
+| **Go** | 1.09 ms | 5.28 ms | 3.92 ms | 38.64 ms |
+| **Python** | 1.76 ms | 4.41 ms | 6.43 ms | 29.43 ms |
 
 </details>
 
@@ -352,12 +353,44 @@ The question this benchmark answers: what if the host language were fast enough 
 
 | Language | Initial Loss | Final Loss | Reduction |
 |----------|-------------|------------|-----------|
-| **Julia** | 7.25 | **0.021** | **-99.7%** |
-| **Go** | 8.47 | **0.022** | **-99.7%** |
-| **Python** | 7.34 | **0.023** | **-99.7%** |
-| **Rust** | 7.82 | **0.024** | **-99.7%** |
+| **Julia** | 7.25 | **0.0208** | **-99.71%** |
+| **Go** | 7.95 | **0.0247** | **-99.69%** |
+| **Python** | 7.34 | **0.0233** | **-99.68%** |
+| **Rust** | 7.80 | **0.0001** | **-100.00%** |
 
-All 4 implementations converge to ~0.02 (from ~7.5), confirming gradient correctness. Run `make convergence` to verify.
+All 4 implementations converge strongly (from ~7.2-7.9 to <=0.025, Rust to ~1e-4), confirming gradient flow and optimizer behavior. Run `make convergence` to verify.
+Detailed engineering revision log: [`docs/convergence-revision-history.md`](docs/convergence-revision-history.md)
+
+Render per-language loss curves (runs each language sequentially and saves JSON + SVG):
+
+```bash
+make convergence-plots
+```
+
+Generated artifacts:
+- `benchmarks/convergence/rust.json`
+- `benchmarks/convergence/go.json`
+- `benchmarks/convergence/python.json`
+- `benchmarks/convergence/julia.json`
+- `docs/assets/convergence/rust.svg`
+- `docs/assets/convergence/go.svg`
+- `docs/assets/convergence/python.svg`
+- `docs/assets/convergence/julia.svg`
+- `docs/assets/convergence/convergence-demo.gif`
+
+### Animated Demo
+
+![Loss convergence animated demo](docs/assets/convergence/convergence-demo.gif)
+
+### Per-language Loss Curves
+
+| Rust | Go |
+|---|---|
+| ![Rust loss convergence](docs/assets/convergence/rust.svg) | ![Go loss convergence](docs/assets/convergence/go.svg) |
+
+| Python | Julia |
+|---|---|
+| ![Python loss convergence](docs/assets/convergence/python.svg) | ![Julia loss convergence](docs/assets/convergence/julia.svg) |
 
 ## Verification Environment
 
@@ -393,12 +426,14 @@ rosetta-moe/
 ├── scripts/
 │   ├── summary.py                # Benchmark summary table generator
 │   ├── convergence_python.py     # Loss convergence verification (Python)
-│   └── convergence_julia.jl      # Loss convergence verification (Julia)
+│   ├── convergence_julia.jl       # Loss convergence verification (Julia)
+│   └── convergence_plots.py      # Sequential run + per-language SVGs + animated GIF
 ├── docs/
 │   ├── spec.md           # Spec: requirements, evaluation matrix, acceptance criteria
 │   ├── bench-results.md  # Results: methodology, 5-axis data, per-language deep analysis
-│   └── analysis-parallel-training.md  # AMX architecture analysis of parallel training scaling
-├── Makefile              # make test / make bench / make convergence / make verify
+│   ├── analysis-parallel-training.md  # AMX architecture analysis of parallel training scaling
+│   └── convergence-revision-history.md  # Trial-and-error log for convergence pipeline and fixes
+├── Makefile              # make test / make bench / make convergence / make convergence-plots / make verify
 └── Cargo.toml
 ```
 
@@ -408,23 +443,35 @@ Each language directory contains its own README with architecture overview, 21-e
 
 Licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). See [LICENSE](LICENSE) for details.
 
-### ⚠️ Commercial Use Notice
+### ⚠️ Usage Restrictions
 
-**This content is licensed under CC BY-NC-SA 4.0.**
+**This content is available for individual learning purposes only.**
 
-**For individual learning purposes**, you are free to use, modify, and redistribute this work at no cost.
+**The following uses require explicit prior permission:**
 
-**However, the following uses are considered "commercial" and are strictly prohibited without explicit prior permission:**
+1. **Any organizational use (commercial or non-profit)**
+   - Corporate/institutional training, educational curricula, internal wikis
+   - University courses or research institution seminars
+   - Non-profit organization training programs
+   - **Rationale**: Organizational use often results in removed attribution links and unauthorized modifications
 
-1. **Corporate/organizational training or educational curricula** (including internal wiki uploads)
-2. **Use in university-sponsored courses funded by for-profit entities**
-3. **Paid courses, bootcamps, seminars, or information products**
+2. **Paid courses, bootcamps, seminars, or information products**
    - Distribution at paid events, displaying screenshots in lectures, or creating derivative educational materials
-4. **LLM/AI model training data**
+
+3. **LLM/AI model training data**
    - Scraping or using this content as a knowledge source for pre-training, fine-tuning, or RAG systems in commercial models
-5. **Any form of monetization or commercialization without explicit permission**
+
+4. **Any form of monetization or commercialization without explicit permission**
    - Including but not limited to: paid articles, e-books, video courses, subscription platforms (Patreon, note, Medium, etc.), or any derivative works sold for profit
 
-**For institutional adoption**, you **must** contact the author and obtain individual permission before use.
+**Individual use includes:**
+- Personal study and research
+- Creating personal notes (for personal use only)
+- Sharing the original article link with friends
 
-**Unauthorized commercial use** may result in billing for usage fees and public disclosure on social media.
+**For organizational use**, you **must**:
+- Contact the author before use
+- Maintain all attribution links
+- Notify the author of how the content is being used
+
+**Unauthorized use** may result in billing for usage fees and public disclosure on social media.
