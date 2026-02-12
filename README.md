@@ -5,13 +5,17 @@
 [![CI](https://github.com/fumishiki/rosetta-moe/actions/workflows/ci.yml/badge.svg)](https://github.com/fumishiki/rosetta-moe/actions/workflows/ci.yml)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange)
-![Go](https://img.shields.io/badge/Go-1.22-blue)
+![Go](https://img.shields.io/badge/Go-1.22+-blue)
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
 ![Julia](https://img.shields.io/badge/Julia-1.10+-purple)
 
 **Same MoE Transformer. 4 languages. 22 benchmark scenarios. One hardware.**
 
-Rust, Go, Python, Julia — each implements the same MoE Transformer from scratch (forward, backward, optimizer, inference). All matmul hits the same Apple Accelerate BLAS on the same M1. No frameworks — every gradient is hand-derived.
+Rust, Go, Python, Julia — each implements the same MoE Transformer from scratch (forward, backward, optimizer, inference). All matmul hits the same Apple Accelerate BLAS on the same M1. No ML frameworks — every gradient is hand-derived.
+
+## Demo
+
+![Loss convergence animated demo](docs/assets/convergence/convergence-demo.gif)
 
 ## Results
 
@@ -43,7 +47,7 @@ Rust leads T4 inference throughput and kernel softmax. Julia leads single-thread
 | T4 | **1,528 trn/s** | 1,055 | 578 | 792 |
 | Speedup | 1.53x | 1.42x | 1.87x | **2.66x** |
 
-Training scaling is lower than inference for Rust/Julia because backward pass increases AMX bus pressure. [Full AMX analysis](docs/analysis-parallel-training.md)
+Training scaling is lower than inference for Rust/Julia because backward pass increases AMX bus pressure.
 
 </details>
 
@@ -55,7 +59,13 @@ Full results with 22 scenarios across 5 axes: [`docs/bench-results.md`](docs/ben
 make test          # test all 4 languages
 make bench         # benchmark + summary table
 make convergence   # verify loss convergence
-make convergence-plots  # run each language + render loss SVGs
+make convergence-plots  # run each language + render convergence demo GIF
+```
+
+One-tap verification (macOS only):
+
+```bash
+make verify
 ```
 
 <details>
@@ -361,38 +371,16 @@ The question this benchmark answers: what if the host language were fast enough 
 All 4 implementations converge strongly (from ~7.2-7.9 to <=0.025, Rust to ~1e-4), confirming gradient flow and optimizer behavior. Run `make convergence` to verify.
 Detailed engineering revision log: [`docs/convergence-revision-history.md`](docs/convergence-revision-history.md)
 
-Render per-language loss curves (runs each language sequentially and saves JSON + SVG):
+Generate convergence artifacts and the animated demo (runs each language sequentially):
 
 ```bash
 make convergence-plots
 ```
 
-Generated artifacts:
-- `benchmarks/convergence/rust.json`
-- `benchmarks/convergence/go.json`
-- `benchmarks/convergence/python.json`
-- `benchmarks/convergence/julia.json`
-- `docs/assets/convergence/rust.svg`
-- `docs/assets/convergence/go.svg`
-- `docs/assets/convergence/python.svg`
-- `docs/assets/convergence/julia.svg`
-- `docs/assets/convergence/convergence-demo.gif`
-
-### Animated Demo
-
-![Loss convergence animated demo](docs/assets/convergence/convergence-demo.gif)
-
-### Per-language Loss Curves
-
-| Rust | Go |
-|---|---|
-| ![Rust loss convergence](docs/assets/convergence/rust.svg) | ![Go loss convergence](docs/assets/convergence/go.svg) |
-
-| Python | Julia |
-|---|---|
-| ![Python loss convergence](docs/assets/convergence/python.svg) | ![Julia loss convergence](docs/assets/convergence/julia.svg) |
-
 ## Verification Environment
+
+**Platform requirement:** This benchmark/verification flow is designed for **macOS (Apple Silicon)** with Apple Accelerate.
+Cross-platform runs are possible for some tasks, but published benchmark numbers and `make verify` expectations are macOS-based.
 
 | Item | Value |
 |------|-------|
@@ -416,28 +404,31 @@ Generated artifacts:
 
 ```text
 rosetta-moe/
-├── rust/                 # Rust: LLVM AOT + NEON SIMD + Accelerate FFI
-│   └── src/bin/convergence.rs  # Loss convergence verification (Rust)
-├── go/                   # Go: CGO Accelerate bridge + goroutines
-│   └── nn_test.go              # TestConvergence (Go convergence verification)
-├── python/               # Python: NumPy → Accelerate + ProcessPoolExecutor
-├── julia/                # Julia: LBT → AppleAccelerate.jl + @fastmath SIMD
-├── benchmarks/           # Raw JSON outputs (4 languages)
+├── rust/                 # Rust implementation (core + benches + tests)
+├── go/                   # Go implementation (CGO Accelerate bridge)
+├── python/               # Python implementation (NumPy + ProcessPoolExecutor)
+├── julia/                # Julia implementation (AppleAccelerate.jl + Threads)
+├── benchmarks/
+│   ├── *.json            # Benchmark summaries per language
+│   └── convergence/      # Per-language convergence JSON outputs
 ├── scripts/
 │   ├── summary.py                # Benchmark summary table generator
-│   ├── convergence_python.py     # Loss convergence verification (Python)
-│   ├── convergence_julia.jl       # Loss convergence verification (Julia)
-│   └── convergence_plots.py      # Sequential run + per-language SVGs + animated GIF
+│   ├── check_docs.py             # Docs-vs-JSON consistency checks
+│   ├── convergence_python.py     # Python convergence runner
+│   ├── convergence_julia.jl      # Julia convergence runner
+│   └── convergence_plots.py      # Sequential run + animated demo generation
 ├── docs/
-│   ├── spec.md           # Spec: requirements, evaluation matrix, acceptance criteria
-│   ├── bench-results.md  # Results: methodology, 5-axis data, per-language deep analysis
-│   ├── analysis-parallel-training.md  # AMX architecture analysis of parallel training scaling
-│   └── convergence-revision-history.md  # Trial-and-error log for convergence pipeline and fixes
+│   ├── spec.md                       # Spec: requirements and acceptance criteria
+│   ├── bench-results.md              # Full benchmark report (22 scenarios)
+│   ├── convergence-revision-history.md # Detailed optimization/change history
+│   └── assets/convergence/
+│       └── convergence-demo.gif      # README demo animation
+├── .github/workflows/     # CI
 ├── Makefile              # make test / make bench / make convergence / make convergence-plots / make verify
 └── Cargo.toml
 ```
 
-Each language directory contains its own README with architecture overview, 21-entry equation-to-code map, implementation notes, performance characteristics, and gotchas.
+Each language directory contains its own README with architecture overview, equation-to-code mapping, implementation notes, and performance caveats.
 
 ## License
 
