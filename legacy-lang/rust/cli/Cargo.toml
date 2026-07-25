@@ -1,0 +1,11 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap.workspace = true
+ratatui.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

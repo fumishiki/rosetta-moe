@@ -1,0 +1,70 @@
+# MoE Transformer Model Configurations
+# Edit these values to customize model architecture
+
+models:
+  # 1.9B parameter model (lightweight, 232M active per token)
+  1.9B:
+    vocab: 256           # Byte-level tokenizer (fixed)
+    hidden: 2048         # Hidden dimension
+    ffn: 16384           # FFN dimension per expert
+    heads: 32            # Number of attention heads
+    kv_heads: 1          # MQA: 1 KV head shared across all Q heads
+    head_dim: 64         # Dimension per attention head
+    experts: 128         # Total number of experts in MoE
+    topk: 8              # Top-k experts to activate per token
+    loops: 4             # Recurrent block iterations (stability: 4)
+    ctx_len: 4096        # Context length for training
+    rope_base: 10000.0   # RoPE base frequency
+    r: 256               # Low-rank dimension for LoRA-style experts
+
+  # 8B parameter model (scaled up)
+  8B:
+    vocab: 256
+    hidden: 4096
+    ffn: 32768
+    heads: 64
+    kv_heads: 8          # GQA: 8 KV heads
+    head_dim: 64
+    experts: 128
+    topk: 8
+    loops: 4
+    ctx_len: 8192        # Longer context length
+    rope_base: 10000.0
+    r: 512               # Higher rank for larger model
+
+# Training hyperparameters
+training:
+  batch_size: 256000   # Total tokens per batch (256K)
+  learning_rate: 1e-3  # Base learning rate
+  warmup_steps: 2000   # LR warmup steps
+  max_steps: 100000    # Total training steps
+  grad_clip: 1.0       # Gradient clipping threshold
+
+  # Optimizer configuration
+  optimizer:
+    hidden_layers: "Muon"   # Use Muon for hidden layers (2D params)
+    embeddings: "AdamW"     # Use AdamW for embeddings/LM head
+    muon_momentum: 0.95
+    muon_nesterov: true
+    adamw_beta1: 0.9
+    adamw_beta2: 0.999
+    adamw_weight_decay: 0.1
+
+# Dynamic patching configuration
+patching:
+  enabled: false       # Enable entropy-based dynamic patching
+  patcher_hidden: 128  # Patcher model hidden dimension
+  threshold: 2.5       # Entropy threshold for boundary detection
+  ema_momentum: 0.95   # EMA smoothing momentum
+
+# Quantization settings
+quantization:
+  enabled: false       # Enable 4-bit quantization
+  scheme: "INT4"       # INT4 or NF4
+  targets:             # Which layers to quantize
+    - "attention"
+    - "expert_ffn"
+  exclude:             # Never quantize these
+    - "embedding"
+    - "lm_head"
+    - "router"
