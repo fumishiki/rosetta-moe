@@ -17,9 +17,14 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
 ]
+metal = [
+    "pyobjc-framework-Metal>=10.0",
+    "pyobjc-framework-MetalPerformanceShaders>=10.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["python*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

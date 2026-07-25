@@ -12,7 +12,8 @@ package nn
 import (
 	"fmt"
 	"math"
-	"math/rand"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -616,24 +617,35 @@ func TestMasterWeights(t *testing.T) {
 	}
 }
 
-// TestConvergence trains the tiny model for 200 steps and outputs loss convergence.
+// TestConvergence trains the tiny model for 500 steps and outputs loss convergence.
 // This test verifies that the training loop reduces loss over multiple iterations,
 // demonstrating that the optimizer and gradient computation are functioning correctly.
 func TestConvergence(t *testing.T) {
 	// Fix RNG seed so weight initialization is reproducible across runs.
-	rand.Seed(42)
+	seed := uint64(42)
+	if s := os.Getenv("CONV_SEED"); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			seed = v
+		}
+	}
+	SeedRNG(seed)
 
 	m := NewTiny()
 	cfg := TrainConfig{
-		LR:          1e-3,
-		Beta1:       0.9,
-		Beta2:       0.95,
-		Eps:         1e-8,
-		WeightDecay: 0.1,
-		GradClip:    1.0,
-		WarmupSteps: 10,
-		TotalSteps:  1200,
-		AuxAlpha:    0.01,
+		LR:           1e-3,
+		Beta1:        0.9,
+		Beta2:        0.95,
+		Eps:          1e-8,
+		WeightDecay:  0.1,
+		GradClip:     0.5,
+		WarmupSteps:  50,
+		TotalSteps:   600,
+		AuxAlpha:     0.01,
+		ZLossWeight:  0.05,
+		RoutingMode:  TopKMode,
+		BiasGamma:    0.001,
+		ReLULambdaL1: 0.01,
+		ReLUTargetK:  2,
 	}
 	trainer := NewTrainer(m, cfg)
 
@@ -647,7 +659,7 @@ func TestConvergence(t *testing.T) {
 	input := FromSlice(inputData, NewShape(batch, seqLen))
 	targets := FromSlice(targetData, NewShape(batch, seqLen))
 
-	nSteps := 1000
+	nSteps := 500
 	losses := make([]float32, nSteps)
 	for i := 0; i < nSteps; i++ {
 		loss := trainer.TrainStep(input, targets)
@@ -675,6 +687,232 @@ func TestConvergence(t *testing.T) {
 
 	if lastQuarterAvg >= firstQuarterAvg {
 		t.Errorf("loss did not decrease: first_quarter_avg=%.6f last_quarter_avg=%.6f",
+			firstQuarterAvg, lastQuarterAvg)
+	}
+}
+
+// TestConvergenceBiasFree trains using DeepSeek-V3 BiasFree routing mode.
+func TestConvergenceBiasFree(t *testing.T) {
+	seed := uint64(43)
+	if s := os.Getenv("CONV_SEED"); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			seed = v
+		}
+	}
+	SeedRNG(seed)
+
+	m := NewTiny()
+	cfg := TrainConfig{
+		LR:           1e-3,
+		Beta1:        0.9,
+		Beta2:        0.95,
+		Eps:          1e-8,
+		WeightDecay:  0.1,
+		GradClip:     0.5,
+		WarmupSteps:  50,
+		TotalSteps:   600,
+		AuxAlpha:     0.01,
+		ZLossWeight:  0.05,
+		RoutingMode:  BiasFreeMode,
+		BiasGamma:    0.001,
+		ReLULambdaL1: 0.01,
+		ReLUTargetK:  2,
+	}
+	trainer := NewTrainer(m, cfg)
+	m.SetRoutingMode(BiasFreeMode, 0.01)
+
+	batch, seqLen := 2, 8
+	inputData := make([]float32, batch*seqLen)
+	targetData := make([]float32, batch*seqLen)
+	for i := range inputData {
+		inputData[i] = float32(i % 1000)
+		targetData[i] = float32((i + 1) % 1000)
+	}
+	input := FromSlice(inputData, NewShape(batch, seqLen))
+	targets := FromSlice(targetData, NewShape(batch, seqLen))
+
+	nSteps := 500
+	losses := make([]float32, nSteps)
+	for i := 0; i < nSteps; i++ {
+		loss := trainer.TrainStep(input, targets)
+		losses[i] = loss
+	}
+
+	// Print JSON
+	lossStrs := make([]string, nSteps)
+	for i, l := range losses {
+		lossStrs[i] = fmt.Sprintf("%.6f", l)
+	}
+	fmt.Printf("{\"language\":\"go_biasfree\",\"steps\":%d,\"losses\":[%s]}\n", nSteps, strings.Join(lossStrs, ","))
+
+	// Check convergence
+	quarter := nSteps / 4
+	firstQuarterAvg := float32(0)
+	lastQuarterAvg := float32(0)
+	for i := 0; i < quarter; i++ {
+		firstQuarterAvg += losses[i]
+		lastQuarterAvg += losses[nSteps-quarter+i]
+	}
+	firstQuarterAvg /= float32(quarter)
+	lastQuarterAvg /= float32(quarter)
+
+	if lastQuarterAvg >= firstQuarterAvg {
+		t.Errorf("BiasFree loss did not decrease: first_quarter_avg=%.6f last_quarter_avg=%.6f",
+			firstQuarterAvg, lastQuarterAvg)
+	}
+}
+
+// TestConvergenceReLU trains using ReMoE ReLU routing mode.
+func TestConvergenceReLU(t *testing.T) {
+	seed := uint64(44)
+	if s := os.Getenv("CONV_SEED"); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			seed = v
+		}
+	}
+	SeedRNG(seed)
+
+	m := NewTiny()
+	cfg := TrainConfig{
+		LR:           1e-3,
+		Beta1:        0.9,
+		Beta2:        0.95,
+		Eps:          1e-8,
+		WeightDecay:  0.1,
+		GradClip:     0.5,
+		WarmupSteps:  50,
+		TotalSteps:   600,
+		AuxAlpha:     0.01,
+		ZLossWeight:  0.05,
+		RoutingMode:  ReLUMode,
+		BiasGamma:    0.001,
+		ReLULambdaL1: 0.01,
+		ReLUTargetK:  2,
+	}
+	trainer := NewTrainer(m, cfg)
+	m.SetRoutingMode(ReLUMode, cfg.ReLULambdaL1)
+
+	batch, seqLen := 2, 8
+	inputData := make([]float32, batch*seqLen)
+	targetData := make([]float32, batch*seqLen)
+	for i := range inputData {
+		inputData[i] = float32(i % 1000)
+		targetData[i] = float32((i + 1) % 1000)
+	}
+	input := FromSlice(inputData, NewShape(batch, seqLen))
+	targets := FromSlice(targetData, NewShape(batch, seqLen))
+
+	nSteps := 500
+	losses := make([]float32, nSteps)
+	for i := 0; i < nSteps; i++ {
+		loss := trainer.TrainStep(input, targets)
+		losses[i] = loss
+	}
+
+	// Print JSON
+	lossStrs := make([]string, nSteps)
+	for i, l := range losses {
+		lossStrs[i] = fmt.Sprintf("%.6f", l)
+	}
+	fmt.Printf("{\"language\":\"go_relu\",\"steps\":%d,\"losses\":[%s]}\n", nSteps, strings.Join(lossStrs, ","))
+
+	// Check convergence
+	quarter := nSteps / 4
+	firstQuarterAvg := float32(0)
+	lastQuarterAvg := float32(0)
+	for i := 0; i < quarter; i++ {
+		firstQuarterAvg += losses[i]
+		lastQuarterAvg += losses[nSteps-quarter+i]
+	}
+	firstQuarterAvg /= float32(quarter)
+	lastQuarterAvg /= float32(quarter)
+
+	if lastQuarterAvg >= firstQuarterAvg {
+		t.Errorf("ReLU loss did not decrease: first_quarter_avg=%.6f last_quarter_avg=%.6f",
+			firstQuarterAvg, lastQuarterAvg)
+	}
+}
+
+// TestConvergenceGpu trains the tiny model for 500 steps using GPU forward pass.
+// This test verifies GPU-accelerated forward + CPU backward convergence.
+func TestConvergenceGpu(t *testing.T) {
+	ctx := NewMetalContext()
+	if ctx == nil {
+		t.Skip("Metal not available")
+	}
+	defer ctx.Close()
+
+	// Load shaders
+	shadersDir := "../shaders"
+	if err := ctx.LoadRequiredShaders(shadersDir); err != nil {
+		t.Fatalf("Failed to load shaders: %v", err)
+	}
+
+	// Fix RNG seed for reproducible weights
+	seed := uint64(42)
+	if s := os.Getenv("CONV_SEED"); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			seed = v
+		}
+	}
+	SeedRNG(seed)
+
+	m := NewTiny()
+	cfg := TrainConfig{
+		LR:           1e-3,
+		Beta1:        0.9,
+		Beta2:        0.95,
+		Eps:          1e-8,
+		WeightDecay:  0.1,
+		GradClip:     0.5,
+		WarmupSteps:  50,
+		TotalSteps:   600,
+		AuxAlpha:     0.01,
+		ZLossWeight:  0.05,
+		RoutingMode:  TopKMode,
+		BiasGamma:    0.001,
+		ReLULambdaL1: 0.01,
+		ReLUTargetK:  2,
+	}
+	trainer := NewTrainer(m, cfg)
+
+	batch, seqLen := 2, 8
+	inputData := make([]float32, batch*seqLen)
+	targetData := make([]float32, batch*seqLen)
+	for i := range inputData {
+		inputData[i] = float32(i % 1000)
+		targetData[i] = float32((i + 1) % 1000)
+	}
+	input := FromSlice(inputData, NewShape(batch, seqLen))
+	targets := FromSlice(targetData, NewShape(batch, seqLen))
+
+	nSteps := 500
+	losses := make([]float32, nSteps)
+	for i := 0; i < nSteps; i++ {
+		loss := GpuTrainStep(ctx, trainer, input, targets)
+		losses[i] = loss
+	}
+
+	// Print JSON
+	lossStrs := make([]string, nSteps)
+	for i, l := range losses {
+		lossStrs[i] = fmt.Sprintf("%.6f", l)
+	}
+	fmt.Printf("{\"language\":\"go_gpu\",\"steps\":%d,\"losses\":[%s]}\n", nSteps, strings.Join(lossStrs, ","))
+
+	// Check convergence: average loss should decrease
+	quarter := nSteps / 4
+	firstQuarterAvg := float32(0)
+	lastQuarterAvg := float32(0)
+	for i := 0; i < quarter; i++ {
+		firstQuarterAvg += losses[i]
+		lastQuarterAvg += losses[nSteps-quarter+i]
+	}
+	firstQuarterAvg /= float32(quarter)
+	lastQuarterAvg /= float32(quarter)
+
+	if lastQuarterAvg >= firstQuarterAvg {
+		t.Errorf("GPU loss did not decrease: first_quarter_avg=%.6f last_quarter_avg=%.6f",
 			firstQuarterAvg, lastQuarterAvg)
 	}
 }

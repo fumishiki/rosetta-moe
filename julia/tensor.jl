@@ -30,12 +30,67 @@ end
 # Convenience constructor: default grad to nothing (backward-compatible)
 Tensor(data::Array{Float32}, dtype::DType) = Tensor(data, dtype, nothing)
 
+# --- Portable LCG for cross-language reproducible weight initialization ---
+# Knuth's MMIX constants (same as generate.jl sampling, Rust/Go/Python init).
+const LCG_MULT = UInt64(6364136223846793005)
+const LCG_U64MAX = Float64(typemax(UInt64))
+const _lcg_state = Ref{UInt64}(UInt64(42))
+
+"""Seed the global LCG for reproducible weight initialization."""
+function seed_rng!(seed::Integer)
+    _lcg_state[] = UInt64(seed)
+    return nothing
+end
+
+function _lcg_uniform()::Float64
+    _lcg_state[] = _lcg_state[] * LCG_MULT + UInt64(1)
+    u = Float64(_lcg_state[]) / LCG_U64MAX
+    return max(u, 1e-10)
+end
+
 # --- Constructors -----------------------------------------------------------
 
 zeros_tensor(dims::Int...; dtype::DType=F32) = Tensor(zeros(Float32, dims...), dtype)
 ones_tensor(dims::Int...; dtype::DType=F32) = Tensor(ones(Float32, dims...), dtype)
-randn_tensor(dims::Int...; dtype::DType=F32) = Tensor(randn(Float32, dims...), dtype)
-randn_std(dims::Int...; std::Float32=1f0, dtype::DType=F32) = Tensor(randn(Float32, dims...) .* std, dtype)
+
+function randn_tensor(dims::Int...; dtype::DType=F32)
+    n = prod(dims)
+    data = Array{Float32}(undef, dims...)
+    # Box-Muller produces samples in pairs (cos, sin) — matches Rust implementation
+    i = 1
+    while i <= n
+        u1 = _lcg_uniform()
+        u2 = _lcg_uniform()
+        r = sqrt(-2.0 * log(u1))
+        θ = 2π * u2
+        data[i] = Float32(r * cos(θ))
+        if i + 1 <= n
+            data[i + 1] = Float32(r * sin(θ))
+        end
+        i += 2
+    end
+    Tensor(data, dtype)
+end
+
+function randn_std(dims::Int...; std::Float32=1f0, dtype::DType=F32)
+    n = prod(dims)
+    data = Array{Float32}(undef, dims...)
+    # Box-Muller produces samples in pairs (cos, sin) — matches Rust implementation
+    i = 1
+    while i <= n
+        u1 = _lcg_uniform()
+        u2 = _lcg_uniform()
+        r = sqrt(-2.0 * log(u1))
+        θ = 2π * u2
+        data[i] = Float32(r * cos(θ)) * std
+        if i + 1 <= n
+            data[i + 1] = Float32(r * sin(θ)) * std
+        end
+        i += 2
+    end
+    Tensor(data, dtype)
+end
+
 from_array(arr::AbstractArray; dtype::DType=F32) = Tensor(Float32.(arr), dtype)
 
 Base.size(t::Tensor) = size(t.data)

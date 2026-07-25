@@ -4,7 +4,7 @@
 use nn_core::{
     AuxLoss, CheckpointContext, CheckpointStorage, Config, CrossEntropyLoss, DType, Layer, Linear,
     LossScaler, MQAttention, MixedPrecisionConfig, MoELayer, MoETransformer, RMSNorm, Router,
-    Shape, SwiGLU, Tensor, TrainConfig, Trainer, TransformerBlock,
+    RoutingMode, Shape, SwiGLU, Tensor, TrainConfig, Trainer, TransformerBlock,
 };
 
 // --- tensor ---
@@ -82,7 +82,7 @@ fn test_generation_interfaces() {
 fn test_transformer_block_shape() {
     let config = Config::tiny();
     let mut block = TransformerBlock::new(&config);
-    let x = Tensor::randn(Shape::new(&[1, 4, 64]), DType::F32, 7);
+    let x = Tensor::randn(Shape::new(&[1, 4, 64]), DType::F32);
     let y = block.forward(&x);
     assert_eq!(y.shape().dims(), &[1, 4, 64]);
 }
@@ -109,7 +109,7 @@ fn test_model_forward_backward() {
 fn test_mqa_attention() {
     let config = Config::default_6_9b();
     let mut attn = MQAttention::new(&config);
-    let x = Tensor::randn(Shape::new(&[1, 4, 768]), DType::F32, 42);
+    let x = Tensor::randn(Shape::new(&[1, 4, 768]), DType::F32);
     let y = attn.forward(&x);
     assert_eq!(y.shape().dims(), &[1, 4, 768]);
 }
@@ -214,7 +214,7 @@ fn test_mixed_precision_config() {
 #[test]
 fn test_router() {
     let mut router = Router::new(8, 4);
-    let x = Tensor::randn(Shape::new(&[1, 2, 8]), DType::F32, 42);
+    let x = Tensor::randn(Shape::new(&[1, 2, 8]), DType::F32);
     let (idx, w, _gate_probs) = router.route(&x, 2);
     assert_eq!(idx.len(), 2);
     assert_eq!(idx[0].len(), 2);
@@ -238,7 +238,66 @@ fn test_moe_layer() {
         rope_alpha: 1.0,
     };
     let mut moe = MoELayer::new(&config);
-    let x = Tensor::randn(Shape::new(&[1, 2, 8]), DType::F32, 42);
+    let x = Tensor::randn(Shape::new(&[1, 2, 8]), DType::F32);
     let y = moe.forward(&x);
     assert_eq!(y.shape().dims(), &[1, 2, 8]);
+}
+
+#[test]
+fn test_routing_mode_biasfree() {
+    let mut model = MoETransformer::tiny();
+    model.set_routing_mode(RoutingMode::BiasFree);
+
+    let train_cfg = TrainConfig {
+        batch_size: 2,
+        seq_len: 4,
+        lr: 1e-3,
+        warmup_steps: 10,
+        total_steps: 50,
+        grad_clip: 0.5,
+        aux_loss_weight: 0.01,
+        z_loss_weight: 0.05,
+        routing_mode: RoutingMode::BiasFree,
+        bias_gamma: 0.001,
+        relu_lambda_l1: 0.01,
+        relu_target_k: 2,
+    };
+    let mut trainer = Trainer::new(model, train_cfg);
+
+    let input = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Shape::new(&[2, 4]));
+    let targets = Tensor::from_slice(&[2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], Shape::new(&[2, 4]));
+
+    let loss = trainer.train_step(&input, &targets);
+    assert!(loss >= 0.0 && loss.is_finite());
+}
+
+#[test]
+fn test_routing_mode_relu() {
+    let mut model = MoETransformer::tiny();
+    model.set_routing_mode(RoutingMode::ReLU);
+
+    let train_cfg = TrainConfig {
+        batch_size: 2,
+        seq_len: 4,
+        lr: 1e-3,
+        warmup_steps: 10,
+        total_steps: 50,
+        grad_clip: 0.5,
+        aux_loss_weight: 0.01,
+        z_loss_weight: 0.05,
+        routing_mode: RoutingMode::ReLU,
+        bias_gamma: 0.001,
+        relu_lambda_l1: 0.01,
+        relu_target_k: 2,
+    };
+    let mut trainer = Trainer::new(model, train_cfg);
+
+    let input = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Shape::new(&[2, 4]));
+    let targets = Tensor::from_slice(&[2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], Shape::new(&[2, 4]));
+
+    let loss = trainer.train_step(&input, &targets);
+    assert!(loss >= 0.0 && loss.is_finite());
+
+    let avg_active = trainer.model().avg_active_experts();
+    assert!(avg_active >= 0.0 && avg_active.is_finite());
 }

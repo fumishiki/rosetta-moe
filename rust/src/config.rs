@@ -90,4 +90,21 @@ impl Config {
             rope_alpha: 1.0,
         }
     }
+
+    pub fn medium() -> Self {
+        Self {
+            hidden_dim: 512,
+            n_layers: 2,
+            n_heads: 8,
+            n_kv_heads: 4,
+            n_experts: 4,
+            top_k_experts: 2,
+            vocab_size: 1000,
+            max_seq_len: 512,
+            ffn_dim: 2048,
+            head_dim: 64,
+            rope_base: 10000.0,
+            rope_alpha: 1.0,
+        }
+    }
 }

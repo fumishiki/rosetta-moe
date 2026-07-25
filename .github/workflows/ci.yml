@@ -90,5 +90,8 @@ jobs:
       - name: Install Julia dependencies
         run: julia --project=julia -e 'using Pkg; Pkg.instantiate()'
 
+      - name: Verify CPU/GPU separation
+        run: make verify-separation
+
       - name: Run all tests
         run: make test

@@ -31,6 +31,16 @@ type Router struct {
 	flatIdx     []int   // flat index backing store for lastIndices
 	auxCountBuf []float32
 	auxProbBuf  []float32
+	// Z-loss buffers
+	lastLogits *Tensor // pre-softmax gate logits for z-loss
+	// Routing mode and BiasFree state
+	routingMode      RoutingMode
+	expertBias       []float32 // BiasFree expert bias (all 0 init)
+	lastExpertCounts []float32 // BiasFree: expert assignment counts
+	// ReLU mode state
+	reluLambdaL1  float32 // ReMoE L1 regularization coefficient
+	lastAvgActive float32 // ReMoE diagnostic: average active expert count
+	lastReLUSum   float32 // ReMoE: sum of ReLU activations for L1 loss
 }
 
 // NewRouter creates a top-K expert router.
@@ -39,11 +49,21 @@ func NewRouter(hiddenDim, nExperts, topK int) *Router {
 		panic("invalid topK for router")
 	}
 	return &Router{
-		gate:     NewLinear(hiddenDim, nExperts, false),
-		nExperts: nExperts,
-		topK:     topK,
-		selected: make([]bool, nExperts),
+		gate:             NewLinear(hiddenDim, nExperts, false),
+		nExperts:         nExperts,
+		topK:             topK,
+		selected:         make([]bool, nExperts),
+		routingMode:      TopKMode,
+		expertBias:       make([]float32, nExperts), // all 0 init
+		lastExpertCounts: make([]float32, nExperts),
+		reluLambdaL1:     0.01,
 	}
+}
+
+// SetRoutingMode configures the routing strategy and lambda for this router.
+func (r *Router) SetRoutingMode(mode RoutingMode, lambda float32) {
+	r.routingMode = mode
+	r.reluLambdaL1 = lambda
 }
 
 // Forward computes expert selection for every token.
@@ -54,9 +74,30 @@ func (r *Router) Forward(input *Tensor) (*Tensor, [][]int) {
 	_, numTokens, featDim := splitLast(input.Shape().DimsRef())
 	flatInput := input.Reshape(NewShape(numTokens, featDim))
 
-	// Gate: linear projection + softmax -> per-expert probabilities.
-	// Reuse softmax output buffer to avoid allocation every call.
+	// Gate: linear projection
 	gateLogits := r.gate.Forward(flatInput)
+	r.lastLogits = gateLogits
+
+	// Reset expert counts for all softmax-based routing modes
+	if r.routingMode == TopKMode || r.routingMode == BiasFreeMode {
+		for i := range r.lastExpertCounts {
+			r.lastExpertCounts[i] = 0
+		}
+	}
+
+	// Route based on mode
+	switch r.routingMode {
+	case TopKMode, BiasFreeMode:
+		return r.forwardSoftmaxBased(gateLogits, numTokens)
+	case ReLUMode:
+		return r.forwardReLU(gateLogits, numTokens)
+	default:
+		panic("unknown routing mode")
+	}
+}
+
+// forwardSoftmaxBased handles TopK and BiasFree routing (both use softmax).
+func (r *Router) forwardSoftmaxBased(gateLogits *Tensor, numTokens int) (*Tensor, [][]int) {
 	probShape := gateLogits.Shape()
 	if r.softmaxBuf == nil || !r.softmaxBuf.Shape().Equal(probShape) {
 		r.softmaxBuf = New(probShape, F32)
@@ -68,9 +109,7 @@ func (r *Router) Forward(input *Tensor) (*Tensor, [][]int) {
 	weights := New(NewShape(numTokens, r.topK), F32)
 	wData := weights.DataPtr()
 
-	// Allocate flat index backing store: one contiguous array for all tokens'
-	// top-K indices, sliced into per-token views. This replaces numTokens
-	// separate make([]int, topK) calls with a single allocation.
+	// Allocate flat index backing store
 	totalIdx := numTokens * r.topK
 	if cap(r.flatIdx) >= totalIdx {
 		r.flatIdx = r.flatIdx[:totalIdx]
@@ -86,8 +125,6 @@ func (r *Router) Forward(input *Tensor) (*Tensor, [][]int) {
 		r.lastIndices[t] = r.flatIdx[t*r.topK : (t+1)*r.topK]
 	}
 
-	// Greedy top-K selection per token: pick the highest probability expert,
-	// mark it selected, repeat K times. O(K*E) per token.
 	selected := r.selected
 	for t := 0; t < numTokens; t++ {
 		row := probsData[t*r.nExperts : (t+1)*r.nExperts]
@@ -95,23 +132,149 @@ func (r *Router) Forward(input *Tensor) (*Tensor, [][]int) {
 		tokenWeights := wData[t*r.topK : (t+1)*r.topK]
 		resetBools(selected)
 
-		for k := 0; k < r.topK; k++ {
-			bestIdx, bestVal := -1, float32(-1)
-			for e := 0; e < r.nExperts; e++ {
-				if !selected[e] && row[e] > bestVal {
-					bestVal = row[e]
-					bestIdx = e
+		if r.routingMode == TopKMode {
+			// TopK: select by probability directly
+			for k := 0; k < r.topK; k++ {
+				bestIdx, bestVal := -1, float32(-1)
+				for e := 0; e < r.nExperts; e++ {
+					if !selected[e] && row[e] > bestVal {
+						bestVal = row[e]
+						bestIdx = e
+					}
 				}
+				selected[bestIdx] = true
+				indices[k] = bestIdx
+				tokenWeights[k] = bestVal
+				r.lastExpertCounts[bestIdx]++
 			}
-			selected[bestIdx] = true
-			indices[k] = bestIdx
-			tokenWeights[k] = bestVal
+		} else {
+			// BiasFree: select by prob + bias, but weight by original prob
+			for k := 0; k < r.topK; k++ {
+				bestIdx, bestScore := -1, float32(-1e38)
+				for e := 0; e < r.nExperts; e++ {
+					if !selected[e] {
+						score := row[e] + r.expertBias[e]
+						if score > bestScore {
+							bestScore = score
+							bestIdx = e
+						}
+					}
+				}
+				selected[bestIdx] = true
+				indices[k] = bestIdx
+				tokenWeights[k] = row[bestIdx] // Use original prob, not augmented score
+				r.lastExpertCounts[bestIdx]++
+			}
 		}
-		// Renormalize so top-K weights sum to 1.
+
+		// Renormalize so top-K weights sum to 1
 		normalizeInPlace(tokenWeights)
 	}
 
 	r.lastWeights = weights
+	return weights, r.lastIndices
+}
+
+// forwardReLU handles ReLU-based routing (ReMoE).
+func (r *Router) forwardReLU(gateLogits *Tensor, numTokens int) (*Tensor, [][]int) {
+	logitsData := gateLogits.DataPtr()
+
+	weights := New(NewShape(numTokens, r.topK), F32)
+	wData := weights.DataPtr()
+
+	totalIdx := numTokens * r.topK
+	if cap(r.flatIdx) >= totalIdx {
+		r.flatIdx = r.flatIdx[:totalIdx]
+	} else {
+		r.flatIdx = make([]int, totalIdx)
+	}
+	if cap(r.lastIndices) >= numTokens {
+		r.lastIndices = r.lastIndices[:numTokens]
+	} else {
+		r.lastIndices = make([][]int, numTokens)
+	}
+	for t := 0; t < numTokens; t++ {
+		r.lastIndices[t] = r.flatIdx[t*r.topK : (t+1)*r.topK]
+	}
+
+	// Track statistics for ReLU mode
+	totalActive := 0
+	reluSum := float32(0)
+
+	for t := 0; t < numTokens; t++ {
+		row := logitsData[t*r.nExperts : (t+1)*r.nExperts]
+		indices := r.lastIndices[t]
+		tokenWeights := wData[t*r.topK : (t+1)*r.topK]
+
+		// Apply ReLU and collect active experts
+		type expertWeight struct {
+			idx    int
+			weight float32
+		}
+		active := make([]expertWeight, 0, r.nExperts)
+		for e := 0; e < r.nExperts; e++ {
+			w := row[e]
+			if w > 0 {
+				active = append(active, expertWeight{e, w})
+				reluSum += w
+			}
+		}
+
+		// If no active experts, force activate argmax with weight 1.0
+		if len(active) == 0 {
+			maxIdx, maxVal := 0, row[0]
+			for e := 1; e < r.nExperts; e++ {
+				if row[e] > maxVal {
+					maxVal = row[e]
+					maxIdx = e
+				}
+			}
+			active = append(active, expertWeight{maxIdx, 1.0})
+		}
+
+		// If too many active, keep only top-k by weight
+		if len(active) > r.topK {
+			// Simple selection sort for top-k
+			for k := 0; k < r.topK; k++ {
+				maxPos := k
+				for i := k + 1; i < len(active); i++ {
+					if active[i].weight > active[maxPos].weight {
+						maxPos = i
+					}
+				}
+				active[k], active[maxPos] = active[maxPos], active[k]
+			}
+			active = active[:r.topK]
+		}
+
+		totalActive += len(active)
+
+		// Renormalize active weights
+		sum := float32(0)
+		for _, ew := range active {
+			sum += ew.weight
+		}
+		if sum < 1e-12 {
+			sum = 1e-12
+		}
+
+		// Pad to topK with (expert=0, weight=0)
+		for k := 0; k < r.topK; k++ {
+			if k < len(active) {
+				indices[k] = active[k].idx
+				tokenWeights[k] = active[k].weight / sum
+			} else {
+				indices[k] = 0
+				tokenWeights[k] = 0
+			}
+		}
+	}
+
+	r.lastAvgActive = float32(totalActive) / float32(numTokens)
+	r.lastReLUSum = reluSum
+
+	r.lastWeights = weights
+	r.lastGateProb = nil // ReLU mode doesn't use softmax probs
 	return weights, r.lastIndices
 }
 
@@ -175,6 +338,248 @@ func (r *Router) ComputeAuxLoss(alpha float32) float32 {
 		auxLoss += (expertCounts[e] / totalAssign) * (expertProbs[e] / float32(numTokens))
 	}
 	return auxLoss * alpha * float32(r.nExperts)
+}
+
+// UpdateExpertBias updates BiasFree expert biases based on load imbalance.
+func (r *Router) UpdateExpertBias(gamma float32) {
+	if r.routingMode != BiasFreeMode {
+		return
+	}
+
+	totalAssignments := float32(0)
+	for _, count := range r.lastExpertCounts {
+		totalAssignments += count
+	}
+	if totalAssignments < 1 {
+		return
+	}
+
+	target := 1.0 / float32(r.nExperts)
+	for e := 0; e < r.nExperts; e++ {
+		f_e := r.lastExpertCounts[e] / totalAssignments
+		delta := target - f_e
+		sign := float32(1)
+		if delta < 0 {
+			sign = -1
+		}
+		r.expertBias[e] += gamma * sign
+	}
+}
+
+// ComputeReLUL1LossWithGrad computes ReLU L1 regularization loss and backprops gradients.
+func (r *Router) ComputeReLUL1LossWithGrad() float32 {
+	if r.routingMode != ReLUMode || r.lastLogits == nil {
+		return 0
+	}
+
+	logitsData := r.lastLogits.DataPtr()
+	numTokens := r.lastLogits.Shape().At(0)
+	batchSeq := float32(numTokens)
+
+	// L_l1 = lambda * mean_t(sum_e relu(logits[t,e]))
+	// Already computed r.lastReLUSum in forwardReLU
+	l1Loss := r.reluLambdaL1 * (r.lastReLUSum / batchSeq)
+
+	// grad_logits[t,e] = lambda * (1/batchSeq) * (1 if logits[t,e] > 0 else 0)
+	gradScale := r.reluLambdaL1 / batchSeq
+	gradLogits := make([]float32, numTokens*r.nExperts)
+	for t := 0; t < numTokens; t++ {
+		for e := 0; e < r.nExperts; e++ {
+			idx := t*r.nExperts + e
+			if logitsData[idx] > 0 {
+				gradLogits[idx] = gradScale
+			}
+		}
+	}
+
+	// Backprop to gate.weight: gate_weight_grad += grad_logits.T @ input
+	if r.gate.lastInput != nil {
+		hiddenDim := r.gate.weight.Shape().At(1)
+		inputData := r.gate.lastInput.DataPtr()
+
+		if r.gate.weight.Grad == nil {
+			r.gate.weight.Grad = make([]float32, r.nExperts*hiddenDim)
+		}
+		gradWeight := r.gate.weight.Grad
+
+		for t := 0; t < numTokens; t++ {
+			for e := 0; e < r.nExperts; e++ {
+				gradL := gradLogits[t*r.nExperts+e]
+				for h := 0; h < hiddenDim; h++ {
+					gradWeight[e*hiddenDim+h] += gradL * inputData[t*hiddenDim+h]
+				}
+			}
+		}
+	}
+
+	return l1Loss
+}
+
+// ComputeZLossWithGrad computes router z-loss (ST-MoE) and backprops to gate weights.
+//
+//	L_z = z_weight * (1/B) * Σ_i logsumexp(logits_i)²
+//
+// Gradient: dL_z/d(logits[i,j]) = z_weight * (2/B) * lse_i * softmax(logits_i)_j
+// Backprops to gate.weight via: gate_weight_grad += Σ_t grad_logits[t,e] * last_input[t,h]
+func (r *Router) ComputeZLossWithGrad(zWeight float32) float32 {
+	if r.lastLogits == nil || r.lastGateProb == nil {
+		return 0
+	}
+
+	logitsData := r.lastLogits.DataPtr()
+	probsData := r.lastGateProb.DataPtr()
+	numTokens := r.lastLogits.Shape().At(0)
+
+	zLossSum := float32(0)
+	gradLogits := make([]float32, numTokens*r.nExperts)
+
+	// Compute z-loss and gradients w.r.t. logits
+	for t := 0; t < numTokens; t++ {
+		offset := t * r.nExperts
+		logitsRow := logitsData[offset : offset+r.nExperts]
+		probsRow := probsData[offset : offset+r.nExperts]
+
+		// logsumexp with max-subtract trick for numerical stability
+		maxLogit := float32(-1e38)
+		for _, l := range logitsRow {
+			if l > maxLogit {
+				maxLogit = l
+			}
+		}
+		sumExp := float32(0)
+		for _, l := range logitsRow {
+			sumExp += ExpF32(l - maxLogit)
+		}
+		lse := maxLogit + LogF32(sumExp)
+
+		zLossSum += lse * lse
+
+		// Gradient: dL_z/d(logits[t,e]) = z_weight * (2/B) * lse * probs[t,e]
+		gradScale := zWeight * (2.0 / float32(numTokens)) * lse
+		for e := 0; e < r.nExperts; e++ {
+			gradLogits[offset+e] = gradScale * probsRow[e]
+		}
+	}
+
+	zLoss := zWeight * zLossSum / float32(numTokens)
+
+	// Backprop grad_logits to gate.weight
+	// gate.weight shape: [nExperts, hiddenDim]
+	// grad_logits shape: [numTokens, nExperts]
+	// lastInput shape: [numTokens, hiddenDim]
+	if r.gate.lastInput != nil {
+		hiddenDim := r.gate.weight.Shape().At(1)
+		inputData := r.gate.lastInput.DataPtr()
+
+		// Ensure gate.weight.Grad is allocated
+		if r.gate.weight.Grad == nil {
+			r.gate.weight.Grad = make([]float32, r.nExperts*hiddenDim)
+		}
+		gradWeight := r.gate.weight.Grad
+
+		for t := 0; t < numTokens; t++ {
+			for e := 0; e < r.nExperts; e++ {
+				gradL := gradLogits[t*r.nExperts+e]
+				for h := 0; h < hiddenDim; h++ {
+					gradWeight[e*hiddenDim+h] += gradL * inputData[t*hiddenDim+h]
+				}
+			}
+		}
+	}
+
+	return zLoss
+}
+
+// ComputeAuxLossWithGrad computes the load-balancing auxiliary loss and backprops to gate weights.
+//
+//	aux_loss = alpha * N_experts * sum_e(f_e * P_e)
+//
+// where:
+//
+//	f_e = fraction of tokens routed to expert e
+//	P_e = mean gate probability for expert e
+//
+// Gradient: dL_aux/d(logits[t,e]) = alpha * N_experts / numTokens * probs[t,e] * (f[e] - dot_fp_t)
+// where dot_fp_t = Σ_{e'} f[e'] * probs[t,e']
+// Backprops to gate.weight via: gate_weight_grad += Σ_t grad_logits[t,e] * last_input[t,h]
+func (r *Router) ComputeAuxLossWithGrad(alpha float32) float32 {
+	if r.lastGateProb == nil {
+		return 0
+	}
+
+	probsData := r.lastGateProb.DataPtr()
+	numTokens := r.lastGateProb.Shape().At(0)
+
+	// Compute f_e (fraction of tokens routed to each expert)
+	totalAssign := float32(0)
+	for _, count := range r.lastExpertCounts {
+		totalAssign += count
+	}
+	if totalAssign < 1 {
+		return 0
+	}
+
+	f_e := make([]float32, r.nExperts)
+	for e := 0; e < r.nExperts; e++ {
+		f_e[e] = r.lastExpertCounts[e] / totalAssign
+	}
+
+	// Compute P_e (mean gate probability per expert)
+	P_e := make([]float32, r.nExperts)
+	for t := 0; t < numTokens; t++ {
+		for e := 0; e < r.nExperts; e++ {
+			P_e[e] += probsData[t*r.nExperts+e]
+		}
+	}
+	for e := 0; e < r.nExperts; e++ {
+		P_e[e] /= float32(numTokens)
+	}
+
+	// Compute scalar aux loss
+	auxLoss := float32(0)
+	for e := 0; e < r.nExperts; e++ {
+		auxLoss += f_e[e] * P_e[e]
+	}
+	auxLoss *= alpha * float32(r.nExperts)
+
+	// Compute gradient w.r.t. logits
+	gradLogits := make([]float32, numTokens*r.nExperts)
+	for t := 0; t < numTokens; t++ {
+		// dot_fp_t = Σ_{e'} f[e'] * probs[t,e']
+		dot_fp_t := float32(0)
+		for e := 0; e < r.nExperts; e++ {
+			dot_fp_t += f_e[e] * probsData[t*r.nExperts+e]
+		}
+
+		// grad_logits[t,e] = alpha * nExperts / numTokens * probs[t,e] * (f[e] - dot_fp_t)
+		gradScale := alpha * float32(r.nExperts) / float32(numTokens)
+		for e := 0; e < r.nExperts; e++ {
+			gradLogits[t*r.nExperts+e] = gradScale * probsData[t*r.nExperts+e] * (f_e[e] - dot_fp_t)
+		}
+	}
+
+	// Backprop to gate.weight: gate_weight_grad += grad_logits.T @ lastInput
+	if r.gate.lastInput != nil {
+		hiddenDim := r.gate.weight.Shape().At(1)
+		inputData := r.gate.lastInput.DataPtr()
+
+		// Ensure gate.weight.Grad is allocated
+		if r.gate.weight.Grad == nil {
+			r.gate.weight.Grad = make([]float32, r.nExperts*hiddenDim)
+		}
+		gradWeight := r.gate.weight.Grad
+
+		for t := 0; t < numTokens; t++ {
+			for e := 0; e < r.nExperts; e++ {
+				gradL := gradLogits[t*r.nExperts+e]
+				for h := 0; h < hiddenDim; h++ {
+					gradWeight[e*hiddenDim+h] += gradL * inputData[t*hiddenDim+h]
+				}
+			}
+		}
+	}
+
+	return auxLoss
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +817,26 @@ func (m *MoELayer) Parameters() []*Tensor {
 // AuxLoss returns the load-balancing auxiliary loss for this layer.
 func (m *MoELayer) AuxLoss(alpha float32) float32 { return m.router.ComputeAuxLoss(alpha) }
 
+// SetRoutingMode configures the routing strategy for this MoE layer.
+func (m *MoELayer) SetRoutingMode(mode RoutingMode, lambda float32) {
+	m.router.SetRoutingMode(mode, lambda)
+}
+
+// UpdateRoutingBiases updates BiasFree expert biases.
+func (m *MoELayer) UpdateRoutingBiases(gamma float32) {
+	m.router.UpdateExpertBias(gamma)
+}
+
+// ApplyReLUL1Loss computes and backprops ReLU L1 regularization loss.
+func (m *MoELayer) ApplyReLUL1Loss() float32 {
+	return m.router.ComputeReLUL1LossWithGrad()
+}
+
+// AvgActiveExperts returns the average number of active experts (ReLU mode).
+func (m *MoELayer) AvgActiveExperts() float32 {
+	return m.router.lastAvgActive
+}
+
 // ---------------------------------------------------------------------------
 // TransformerBlock
 // ---------------------------------------------------------------------------
@@ -490,3 +915,23 @@ func (blk *TransformerBlock) Parameters() []*Tensor {
 
 // AuxLoss returns the MoE auxiliary loss for this block.
 func (blk *TransformerBlock) AuxLoss(alpha float32) float32 { return blk.moe.AuxLoss(alpha) }
+
+// SetRoutingMode configures the routing strategy for this block.
+func (blk *TransformerBlock) SetRoutingMode(mode RoutingMode, lambda float32) {
+	blk.moe.SetRoutingMode(mode, lambda)
+}
+
+// UpdateRoutingBiases updates BiasFree expert biases.
+func (blk *TransformerBlock) UpdateRoutingBiases(gamma float32) {
+	blk.moe.UpdateRoutingBiases(gamma)
+}
+
+// ApplyReLUL1Loss computes and backprops ReLU L1 regularization loss.
+func (blk *TransformerBlock) ApplyReLUL1Loss() float32 {
+	return blk.moe.ApplyReLUL1Loss()
+}
+
+// AvgActiveExperts returns the average number of active experts.
+func (blk *TransformerBlock) AvgActiveExperts() float32 {
+	return blk.moe.AvgActiveExperts()
+}

@@ -7,6 +7,9 @@
 # Two presets are provided: tiny() for testing and default_6_9b() for a
 # realistic 6.9B-parameter model.
 
+@enum DType F32 F16 BF16 I32 I64
+@enum RoutingMode TopKMode BiasFreeMode ReLUMode
+
 struct Config
     hidden_dim::Int;    n_layers::Int;    n_heads::Int;     n_kv_heads::Int
     n_experts::Int;     top_k_experts::Int; vocab_size::Int; max_seq_len::Int
@@ -18,6 +21,9 @@ tiny() = Config(64, 2, 4, 1, 4, 2, 1000, 512, 256, 16, 10000f0, 1f0)
 
 # Small config for scale comparison benchmarks (256-dim, 2 layers, 4 heads)
 small() = Config(256, 2, 4, 1, 4, 2, 1000, 512, 1024, 64, 10000f0, 1f0)
+
+# Medium config for scale comparison benchmarks (512-dim, 2 layers, 8 heads)
+medium() = Config(512, 2, 8, 4, 4, 2, 1000, 512, 2048, 64, 10000f0, 1f0)
 
 # Realistic 6.9B config (768-dim, 30 layers, 12 heads, 16 experts top-4)
 default_6_9b() = Config(768, 30, 12, 1, 16, 4, 32000, 32768, 6144, 64, 10000f0, 8f0)

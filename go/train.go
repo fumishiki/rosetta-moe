@@ -5,31 +5,53 @@ package nn
 
 import "strings"
 
+// RoutingMode defines the MoE routing strategy.
+type RoutingMode int
+
+const (
+	// TopKMode is the current implementation (softmax + greedy top-k + aux_loss + z_loss)
+	TopKMode RoutingMode = iota
+	// BiasFreeMode implements DeepSeek-V3 (softmax + bias-augmented top-k)
+	BiasFreeMode
+	// ReLUMode implements ReMoE (ReLU gate + L1 regularization)
+	ReLUMode
+)
+
 // TrainConfig holds optimizer and training hyperparameters.
 type TrainConfig struct {
-	LR          float32 // peak learning rate
-	Beta1       float32 // AdamW first moment decay
-	Beta2       float32 // AdamW second moment decay
-	Eps         float32 // AdamW epsilon (numerical stability)
-	WeightDecay float32 // AdamW weight decay coefficient
-	GradClip    float32 // max gradient L2 norm
-	WarmupSteps int     // linear warmup phase length
-	TotalSteps  int     // total training steps (for cosine schedule)
-	AuxAlpha    float32 // MoE auxiliary loss coefficient
+	LR           float32     // peak learning rate
+	Beta1        float32     // AdamW first moment decay
+	Beta2        float32     // AdamW second moment decay
+	Eps          float32     // AdamW epsilon (numerical stability)
+	WeightDecay  float32     // AdamW weight decay coefficient
+	GradClip     float32     // max gradient L2 norm
+	WarmupSteps  int         // linear warmup phase length
+	TotalSteps   int         // total training steps (for cosine schedule)
+	AuxAlpha     float32     // MoE auxiliary loss coefficient
+	ZLossWeight  float32     // Router z-loss weight (ST-MoE)
+	RoutingMode  RoutingMode // routing strategy (default: TopKMode)
+	BiasGamma    float32     // BiasFree bias update rate (default: 0.001)
+	ReLULambdaL1 float32     // ReMoE L1 regularization coefficient (default: 0.01)
+	ReLUTargetK  int         // ReMoE target active expert count (default: top_k)
 }
 
 // DefaultTrainConfig returns standard training hyperparameters.
 func DefaultTrainConfig() TrainConfig {
 	return TrainConfig{
-		LR:          1e-4,
-		Beta1:       0.9,
-		Beta2:       0.95,
-		Eps:         1e-8,
-		WeightDecay: 0.1,
-		GradClip:    1.0,
-		WarmupSteps: 1000,
-		TotalSteps:  100000,
-		AuxAlpha:    0.01,
+		LR:           1e-4,
+		Beta1:        0.9,
+		Beta2:        0.95,
+		Eps:          1e-8,
+		WeightDecay:  0.1,
+		GradClip:     0.5,
+		WarmupSteps:  1000,
+		TotalSteps:   100000,
+		AuxAlpha:     0.01,
+		ZLossWeight:  0.05, // Phase 0: increased from 0.01 to 0.05
+		RoutingMode:  TopKMode,
+		BiasGamma:    0.001,
+		ReLULambdaL1: 0.01,
+		ReLUTargetK:  2,
 	}
 }
 
@@ -195,37 +217,39 @@ func clipTensorByGlobalNorm(t *Tensor, clipNorm float32) float32 {
 	return norm
 }
 
-// TrainStep performs a single training step: forward, loss, backward, AdamW update.
-//
-// AdamW update rule per parameter:
-//
-//	m = beta1 * m + (1 - beta1) * g           -- first moment
-//	v = beta2 * v + (1 - beta2) * g^2          -- second moment
-//	m_hat = m / (1 - beta1^t)                  -- bias correction
-//	v_hat = v / (1 - beta2^t)                  -- bias correction
-//	w -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * w)
-//
-// The weight decay term is applied directly to w (decoupled, hence "AdamW"),
-// not added to the gradient.
-func (t *Trainer) TrainStep(input, targets *Tensor) float32 {
+// TrainStepFromLogits performs a training step using pre-computed logits.
+// Used by GPU hybrid pipeline: forward on GPU, backward + optimizer on CPU.
+func (t *Trainer) TrainStepFromLogits(logits, targets *Tensor) float32 {
 	t.step++
 
-	// Zero all parameter gradients before forward/backward
+	// Zero all parameter gradients
 	params := t.params
 	for _, p := range params {
 		p.ZeroGrad()
 	}
 
-	// Forward pass
-	logits := t.model.Forward(input)
+	// Loss + gradient from pre-computed logits
 	loss, gradOutput := t.crossEntropyLossGrad(logits, targets)
-
-	// Add auxiliary loss from MoE routers (load balancing)
-	auxLoss := t.model.TotalAuxLoss(t.config.AuxAlpha)
-	totalLoss := loss + auxLoss
 
 	// Backward pass: computes and stores per-parameter gradients on param.Grad
 	_ = t.model.Backward(gradOutput)
+
+	// Routing-mode specific losses
+	var auxLoss, zLoss, reluL1 float32
+	switch t.config.RoutingMode {
+	case TopKMode:
+		// Original: aux_loss + z_loss (both with gradients)
+		auxLoss = t.model.ApplyAuxLoss(t.config.AuxAlpha)
+		zLoss = t.model.ApplyZLoss(t.config.ZLossWeight)
+	case BiasFreeMode:
+		// DeepSeek-V3: no aux_loss, only z_loss
+		zLoss = t.model.ApplyZLoss(t.config.ZLossWeight)
+	case ReLUMode:
+		// ReMoE: no aux_loss, no z_loss, only ReLU L1 regularization
+		reluL1 = t.model.ApplyReLUL1Loss()
+	}
+
+	totalLoss := loss + auxLoss + zLoss + reluL1
 
 	// Global gradient norm clipping across all parameters
 	globalNormSq := float32(0)
@@ -282,7 +306,45 @@ func (t *Trainer) TrainStep(input, targets *Tensor) float32 {
 		}
 	}
 
+	// Post-step updates for routing modes
+	switch t.config.RoutingMode {
+	case BiasFreeMode:
+		// Update expert biases based on load imbalance
+		t.model.UpdateRoutingBiases(t.config.BiasGamma)
+	case ReLUMode:
+		// Adaptive lambda adjustment based on average active expert count
+		avgActive := t.model.AvgActiveExperts()
+		targetK := float32(t.config.ReLUTargetK)
+		if avgActive < targetK*0.9 {
+			// Too few active experts, decrease lambda
+			t.config.ReLULambdaL1 *= 0.99
+		} else if avgActive > targetK*1.1 {
+			// Too many active experts, increase lambda
+			t.config.ReLULambdaL1 *= 1.01
+		}
+		// Propagate updated lambda to all routers
+		t.model.SetRoutingMode(ReLUMode, t.config.ReLULambdaL1)
+	}
+
 	return totalLoss
+}
+
+// TrainStep performs a single training step: forward, loss, backward, AdamW update.
+// Delegates to TrainStepFromLogits after computing logits.
+//
+// AdamW update rule per parameter:
+//
+//	m = beta1 * m + (1 - beta1) * g           -- first moment
+//	v = beta2 * v + (1 - beta2) * g^2          -- second moment
+//	m_hat = m / (1 - beta1^t)                  -- bias correction
+//	v_hat = v / (1 - beta2^t)                  -- bias correction
+//	w -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * w)
+//
+// The weight decay term is applied directly to w (decoupled, hence "AdamW"),
+// not added to the gradient.
+func (t *Trainer) TrainStep(input, targets *Tensor) float32 {
+	logits := t.model.Forward(input)
+	return t.TrainStepFromLogits(logits, targets)
 }
 
 // ---------------------------------------------------------------------------

@@ -7,53 +7,62 @@ Zero external dependencies beyond the standard library and Apple Accelerate via 
 
 ## Architecture
 
-```
+```text
 go/
-├── tensor.go       # Tensor type, flat []float32 storage, pure-f32 math (exp/sqrt/log/sin/cos)
-├── config.go       # Model hyperparameters (Default6_9B, Tiny presets)
-├── layers.go       # Embedding, Linear, RMSNorm, SwiGLU
-├── attention.go    # Multi-Query Attention with RoPE (causal, NTK-aware scaling)
-├── moe.go          # Router (top-K gating), MoELayer (sparse dispatch), TransformerBlock
-├── model.go        # MoETransformer (full model assembly)
-├── generate.go     # Sampling strategies (greedy, temperature, top-K, top-P)
-├── train.go        # CrossEntropy loss, AdamW optimizer, LR schedule, checkpointing, loss scaling
-├── sgemm.go        # Apple Accelerate CGO wrapper (cblas_sgemm)
-├── bench_test.go   # Benchmark harness (5 axes: memory, compiler, type system, parallel, scale)
+├── cpu/            # CPU implementation package (bench target)
+│   ├── tensor.go
+│   ├── config.go
+│   ├── layers.go
+│   ├── attention.go
+│   ├── moe.go
+│   ├── model.go
+│   ├── generate.go
+│   ├── train.go
+│   ├── sgemm.go
+│   └── bench_cpu_test.go
+├── gpu/            # GPU benchmark package (Metal/MPS)
+│   ├── metal.go
+│   ├── metal_bridge.h
+│   ├── metal_bridge.m
+│   ├── metal_stub.go
+│   └── bench_gpu_test.go
 ├── nn_test.go      # Unit and integration tests
+├── metal_test.go   # Metal availability tests
+├── bench_test.go   # Legacy benchmark harness (compatibility)
 └── go.mod          # Module definition (Go 1.22+)
 ```
 
-All files belong to package `nn`. No subdirectories.
+Current benchmark path is split by package: CPU (`go/cpu`) and GPU (`go/gpu`). Root-level implementation files remain for compatibility. CPU and GPU benchmarks are independently executable (`./cpu` vs `./gpu`).
 
 ## Equation-to-Code Map
 
 | Formula | File | Function |
 |---------|------|----------|
-| `C = A @ B` (GEMM) | `sgemm.go` | `sgemm()` |
-| `C = A @ B^T` | `sgemm.go` | `sgemmTransB()` |
-| `Softmax: p_i = exp(x_i - max) / sum(exp(x_j - max))` | `tensor.go` | `Softmax()` |
-| `SiLU(x) = x / (1 + exp(-x))` | `tensor.go` | `SiLU()` |
-| `RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma` | `layers.go` | `RMSNorm.Forward()` |
-| `Linear: y = x @ W^T + b` | `layers.go` | `Linear.Forward()` |
-| `Embedding: out[b,s] = W[token_id]` | `layers.go` | `Embedding.Forward()` |
-| `SwiGLU: out = W_down @ (SiLU(W_gate @ x) * W_up @ x)` | `layers.go` | `SwiGLU.Forward()` |
-| `RoPE: [x0,x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]` | `attention.go` | `applyRoPE()` |
-| `Attention: softmax(Q@K^T/sqrt(d)) @ V` | `attention.go` | `MQAttention.Forward()` |
-| `MoE: out = sum_k(w_k * Expert_k(x))` | `moe.go` | `MoELayer.Forward()` |
-| `Gate: probs = softmax(W_gate @ x), top-K select` | `moe.go` | `Router.Forward()` |
-| `AuxLoss: alpha * N * sum(f_e * P_e)` | `moe.go` | `Router.ComputeAuxLoss()` |
-| `CrossEntropy: L = -mean(log(softmax(logits)[target]))` | `train.go` | `crossEntropyLoss()` |
-| `CE Grad: (softmax(logits) - one_hot) / N` | `train.go` | `crossEntropyGrad()` |
-| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat/(sqrt(v_hat)+e)+wd*w)` | `train.go` | `Trainer.TrainStep()` |
-| `LR Schedule: warmup linear + cosine decay` | `train.go` | `Trainer.GetLR()` |
-| `Grad Clip: t *= clip/(norm+eps) if norm > clip` | `train.go` | `clipTensorByGlobalNorm()` |
-| `exp(x) = 2^k * Horner(r)` | `tensor.go` | `ExpF32()` |
-| `sqrt(x) = x * fast_inv_sqrt(x)` (Quake III + Newton) | `tensor.go` | `SqrtF32()` |
-| `ln(x) = e*ln2 + atanh_poly(m)` | `tensor.go` | `LogF32()` |
+| `C = A @ B` (GEMM) | `cpu/sgemm.go` | `sgemm()` |
+| `C = A @ B^T` | `cpu/sgemm.go` | `sgemmTransB()` |
+| `Softmax: p_i = exp(x_i - max) / sum(exp(x_j - max))` | `cpu/tensor.go` | `Softmax()` |
+| `SiLU(x) = x / (1 + exp(-x))` | `cpu/tensor.go` | `SiLU()` |
+| `RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma` | `cpu/layers.go` | `RMSNorm.Forward()` |
+| `Linear: y = x @ W^T + b` | `cpu/layers.go` | `Linear.Forward()` |
+| `Embedding: out[b,s] = W[token_id]` | `cpu/layers.go` | `Embedding.Forward()` |
+| `SwiGLU: out = W_down @ (SiLU(W_gate @ x) * W_up @ x)` | `cpu/layers.go` | `SwiGLU.Forward()` |
+| `RoPE: [x0,x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]` | `cpu/attention.go` | `applyRoPE()` |
+| `Attention: softmax(Q@K^T/sqrt(d)) @ V` | `cpu/attention.go` | `MQAttention.Forward()` |
+| `MoE: out = sum_k(w_k * Expert_k(x))` | `cpu/moe.go` | `MoELayer.Forward()` |
+| `Gate: probs = softmax(W_gate @ x), top-K select` | `cpu/moe.go` | `Router.Forward()` |
+| `AuxLoss: alpha * N * sum(f_e * P_e)` | `cpu/moe.go` | `Router.ComputeAuxLoss()` |
+| `CrossEntropy: L = -mean(log(softmax(logits)[target]))` | `cpu/train.go` | `crossEntropyLoss()` |
+| `CE Grad: (softmax(logits) - one_hot) / N` | `cpu/train.go` | `crossEntropyGrad()` |
+| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat/(sqrt(v_hat)+e)+wd*w)` | `cpu/train.go` | `Trainer.TrainStep()` |
+| `LR Schedule: warmup linear + cosine decay` | `cpu/train.go` | `Trainer.GetLR()` |
+| `Grad Clip: t *= clip/(norm+eps) if norm > clip` | `cpu/train.go` | `clipTensorByGlobalNorm()` |
+| `exp(x) = 2^k * Horner(r)` | `cpu/tensor.go` | `ExpF32()` |
+| `sqrt(x) = x * fast_inv_sqrt(x)` (Quake III + Newton) | `cpu/tensor.go` | `SqrtF32()` |
+| `ln(x) = e*ln2 + atanh_poly(m)` | `cpu/tensor.go` | `LogF32()` |
 
 ## Implementation Notes
 
-### CGO Accelerate Integration (`sgemm.go`)
+### CGO Accelerate Integration (`cpu/sgemm.go`)
 
 Matrix multiplication is delegated to Apple Accelerate's `cblas_sgemm`, which routes
 through the AMX coprocessor on Apple Silicon (7-14x faster than NEON SIMD).
@@ -182,6 +191,20 @@ alloc_rate = (total_alloc_after - total_alloc_before) / num_trials / median_wall
 This gives bytes/sec of heap allocation during steady-state operation, excluding one-time
 setup costs.
 
+## GPU (Metal/MPS)
+
+Requires macOS with Apple Silicon. The Metal backend uses CGO with Objective-C bridging.
+
+```bash
+go test -run=TestMetalMatmul -v ./...                            # verify Metal works
+go test -run=TestBenchGPU -v -count=1 -timeout=600s ./gpu       # run GPU-only benchmarks
+go test -run=TestBenchCPU -v -count=1 -timeout=600s ./cpu       # run CPU-only benchmarks
+ROSETTA_BENCH_TRIALS=30 ROSETTA_BENCH_WARMUP=3 go test -run=TestBenchCPU -v -count=1 -timeout=600s ./cpu
+```
+
+Non-macOS platforms use stub implementations (metal_stub.go) that return nil/false.
+GPU scenarios are gated by `MetalAvailable()` runtime check. Timed GPU loops keep compute on Metal-side buffers; host materialization is outside the timed path.
+
 ## Build and Test
 
 ```bash
@@ -193,6 +216,13 @@ go test -v -count=1 -timeout 300s ./...
 
 # Build check
 go build ./...
+```
+
+Project-root one-shot runs:
+
+```bash
+cd .. && make bench-all
+cd .. && make bench-all-30
 ```
 
 Requires:

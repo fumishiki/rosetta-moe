@@ -7,6 +7,10 @@ Pure Python + NumPy implementation of a Mixture-of-Experts Transformer.
 No framework dependencies (PyTorch, JAX, etc.) -- all operations and
 gradients are hand-implemented using NumPy as the numerical backend.
 
+Subpackages:
+  - cpu/: CPU-only NumPy implementation (default)
+  - gpu/: Metal GPU implementation using PyObjC (requires macOS + Apple Silicon)
+
 Key components:
   - Tensor: thin wrapper around numpy ndarrays (tensor.py)
   - Layers: Embedding, RMSNorm, Linear, SwiGLU (layers.py)
@@ -17,7 +21,8 @@ Key components:
   - Train: AdamW optimizer, loss, LR scheduling (train.py)
 """
 
-from .tensor import Tensor, DType
+# Re-export top-level API from existing files (backward compat)
+from .tensor import Tensor, DType, seed_rng
 from .config import Config
 from .layers import Embedding, RMSNorm, Linear, SwiGLU
 from .attention import MQAttention
@@ -48,8 +53,13 @@ from .train import (
 )
 
 __all__ = [
+    # Subpackages
+    "cpu",
+    "gpu",
+    # Backward-compatible top-level exports
     "Tensor",
     "DType",
+    "seed_rng",
     "Config",
     "Embedding",
     "RMSNorm",

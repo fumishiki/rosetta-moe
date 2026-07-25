@@ -140,9 +140,9 @@ Key derived metrics:
 
 ---
 
-## 3. Results -- 4 Research Axes
+## 3. Results -- 6 Research Axes
 
-22 scenarios across 5 axes. Each axis isolates a distinct language/runtime characteristic.
+33 scenarios across 6 axes (24 CPU + 9 GPU). Each axis isolates a distinct language/runtime characteristic.
 
 | Axis | Isolates | Scenarios |
 |------|----------|-----------|
@@ -151,6 +151,7 @@ Key derived metrics:
 | 3. Type System | Mono vs interface vs dispatch | 2 (warm, cold) |
 | 4. Parallel | Thread vs goroutine vs process | 6 (inference T1/T2/T4, training T1/T2/T4) |
 | 5. Scale | Convergence at larger model size | 2 (forward_256, train_256) |
+| 6. GPU | Metal/MPS kernel and end-to-end behavior | 9 (kernel + forward + train) |
 
 ---
 
@@ -505,7 +506,7 @@ Note: Matmul GFLOPS differences between Rust and Julia (662 vs 547) are within m
 
 ### Cross-Language Insights
 
-The following insights emerge from comparing results across all 5 axes and languages.
+The following insights emerge from comparing results across all 6 axes and languages.
 
 #### 1. BLAS Levels the Playing Field
 
@@ -616,6 +617,56 @@ Forward spread halved (-54%) from h=64 to h=256 as BLAS share grows. Training co
 **Measured convergence: forward spread 4.16x → 1.90x at hidden=256 (-54%), training spread 10.03x → 5.20x (-48%).** Language differences narrow as BLAS fraction grows. Training differences persist longer due to backward pass architecture choices — Julia's language-level fusion compilation vs Rust's manual zero-alloc loops.
 
 **Note:** All measurements are on Apple M1 (AMX). On production GPUs, the overhead structure changes fundamentally: Rust's kernel launch overhead would match Julia's (both zero-GC, direct memory control), but Julia retains an architectural advantage through Reactant.jl (XLA-based automatic kernel fusion). Treat absolute numbers as M1-specific reference data.
+
+---
+
+## h=512 Scale Results
+
+| Language | Forward 512 (ms) | Train 512 (ms) | Forward spread (512 vs 64) |
+|----------|-------------------|-----------------|----------------------------|
+| Rust     | _pending_         | _pending_       | _pending_                  |
+| Julia    | _pending_         | _pending_       | _pending_                  |
+| Go       | _pending_         | _pending_       | _pending_                  |
+| Python   | _pending_         | _pending_       | _pending_                  |
+
+Results will be populated after `make bench-cpu` (CPU-only) or `make bench-all` (CPU+GPU) with h=512 scenarios.
+
+## Axis 6: GPU Results (Metal/MPS on M1)
+
+### GPU Kernel Benchmarks
+
+| Language | MPS matmul 256×256 (ms) | Softmax 1×1000 (us) | RMSNorm 2×64 (us) |
+|----------|-------------------------|----------------------|--------------------|
+| Rust     | _pending_               | _pending_            | _pending_          |
+| Julia    | _pending_               | _pending_            | _pending_          |
+| Go       | _pending_               | _pending_            | _pending_          |
+| Python   | _pending_               | _pending_            | _pending_          |
+
+### GPU Forward Pass
+
+| Language | GPU Forward 64 (ms) | GPU Forward 256 (ms) | GPU Forward 512 (ms) |
+|----------|---------------------|----------------------|----------------------|
+| Rust     | _pending_           | _pending_            | _pending_            |
+| Julia    | _pending_           | _pending_            | _pending_            |
+| Go       | _pending_           | _pending_            | _pending_            |
+| Python   | _pending_           | _pending_            | _pending_            |
+
+### CPU↔GPU Crossover Analysis
+
+At which model size does GPU (MPS) surpass CPU (Accelerate BLAS/AMX)?
+
+| Language | Forward crossover | Train crossover | Notes |
+|----------|-------------------|-----------------|-------|
+| Rust     | _pending_         | _pending_       |       |
+| Julia    | _pending_         | _pending_       |       |
+| Go       | _pending_         | _pending_       |       |
+| Python   | _pending_         | _pending_       |       |
+
+**Research Questions**:
+1. What hidden_dim triggers GPU advantage over CPU AMX?
+2. Does the language gap observed on CPU persist on GPU?
+3. What is the per-language Metal dispatch overhead?
+4. Does M1 unified memory eliminate CPU↔GPU transfer cost?
 
 ---
 

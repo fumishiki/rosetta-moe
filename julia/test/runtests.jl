@@ -214,7 +214,7 @@ using .MoETransformer
         end
         @testset "lr schedule" begin
             m = tiny_model()
-            cfg = TrainConfig(1f-3, 0.9f0, 0.95f0, 1f-8, 0.1f0, 1f0, 100, 1000, 0.01f0)
+            cfg = TrainConfig(1f-3, 0.9f0, 0.95f0, 1f-8, 0.1f0, 1f0, 100, 1000, 0.01f0, 0.01f0, TopKMode, 0.001f0, 0.01f0, 2)
             trainer = Trainer(m, cfg)
             trainer.step = 0
             @test get_lr(trainer) == 0f0
@@ -223,6 +223,43 @@ using .MoETransformer
             trainer.step = cfg.total_steps * 10
             min_lr = cfg.lr * 0.1f0
             @test get_lr(trainer) >= min_lr - 1f-7
+        end
+        @testset "BiasFree routing" begin
+            m = tiny_model()
+            set_routing_mode!(m, BiasFreeMode)
+            cfg = TrainConfig(1f-3, 0.9f0, 0.95f0, 1f-8, 0.0f0, 0.5f0, 10, 100, 0.01f0, 0.05f0, BiasFreeMode, 0.001f0, 0.01f0, 2)
+            trainer = Trainer(m, cfg)
+            batch, seq_len = 2, 4
+            input_data = Float32[Float32(mod(i, 50)) for i in 0:batch*seq_len-1]
+            target_data = Float32[Float32(mod(i + 1, 50)) for i in 0:batch*seq_len-1]
+            input = from_array(reshape(input_data, batch, seq_len))
+            targets = from_array(reshape(target_data, batch, seq_len))
+            loss = train_step!(trainer, input, targets)
+            @test loss >= 0f0
+            @test trainer.step == 1
+            # Check that expert biases are updated
+            for blk in m.blocks
+                bias_sum = sum(abs.(blk.moe.router.expert_bias))
+                @test bias_sum > 0f0  # Some bias should be nonzero after update
+            end
+        end
+        @testset "ReLU routing" begin
+            m = tiny_model()
+            set_routing_mode!(m, ReLUMode)
+            cfg = TrainConfig(1f-3, 0.9f0, 0.95f0, 1f-8, 0.0f0, 0.5f0, 10, 100, 0.01f0, 0.0f0, ReLUMode, 0.0f0, 0.01f0, 2)
+            trainer = Trainer(m, cfg)
+            batch, seq_len = 2, 4
+            input_data = Float32[Float32(mod(i, 50)) for i in 0:batch*seq_len-1]
+            target_data = Float32[Float32(mod(i + 1, 50)) for i in 0:batch*seq_len-1]
+            input = from_array(reshape(input_data, batch, seq_len))
+            targets = from_array(reshape(target_data, batch, seq_len))
+            loss = train_step!(trainer, input, targets)
+            @test loss >= 0f0
+            @test trainer.step == 1
+            # Check that avg_active is computed
+            avg_active = avg_active_experts(m)
+            @test avg_active >= 0f0
+            @test avg_active <= Float32(m.config.n_experts)
         end
     end
 

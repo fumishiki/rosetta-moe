@@ -11,5 +11,22 @@ autobenches = false
 name = "bench"
 path = "benches/bench.rs"
 
+[[bin]]
+name = "convergence"
+path = "src/bin/convergence.rs"
+
+[[bin]]
+name = "convergence_gpu"
+path = "src/bin/convergence_gpu.rs"
+required-features = ["metal"]
+
+[features]
+default = ["cpu"]
+cpu = []
+metal = []
+
 [dependencies]
 libc = "0.2"
+
+[build-dependencies]
+cc = "1"

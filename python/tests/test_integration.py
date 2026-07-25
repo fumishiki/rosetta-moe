@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from python.tensor import Tensor, DType
+from python.tensor import Tensor, DType, seed_rng
 from python.layers import Linear, RMSNorm, SwiGLU
 from python.config import Config
 from python.attention import MQAttention
@@ -35,9 +35,11 @@ from python.train import (
     MixedPrecisionConfig,
     MasterWeights,
     clip_grad_by_global_norm,
+    RoutingMode,
 )
 
 np.random.seed(42)
+seed_rng(42)
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +307,79 @@ class TestCheckpoint:
         assert ctx.should_checkpoint(0) is True
         assert ctx.should_checkpoint(1) is False
         assert ctx.should_checkpoint(2) is True
+
+
+# ---------------------------------------------------------------------------
+# Routing Modes
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingModes:
+    def test_biasfree_routing(self):
+        """Test BiasFree routing mode."""
+        model = MoETransformer.tiny()
+        model.set_routing_mode(RoutingMode.BIAS_FREE)
+        config = TrainConfig(
+            routing_mode=RoutingMode.BIAS_FREE,
+            bias_gamma=0.001,
+        )
+        trainer = Trainer(model, config)
+
+        input_ids = Tensor.from_numpy(np.array([[1, 2, 3, 4]]))
+        targets = Tensor.from_numpy(np.array([[2, 3, 4, 5]]))
+
+        # Run a few steps
+        losses = []
+        for _ in range(5):
+            loss = trainer.train_step(input_ids, targets)
+            losses.append(loss)
+
+        assert all(np.isfinite(l) for l in losses)
+        # Verify bias was updated
+        for block in model.blocks:
+            assert np.any(block.moe.router.expert_bias != 0.0)
+
+    def test_relu_routing(self):
+        """Test ReLU routing mode."""
+        model = MoETransformer.tiny()
+        model.set_routing_mode(RoutingMode.RELU)
+        config = TrainConfig(
+            routing_mode=RoutingMode.RELU,
+            relu_lambda_l1=0.01,
+            relu_target_k=2,
+        )
+        trainer = Trainer(model, config)
+
+        input_ids = Tensor.from_numpy(np.array([[1, 2, 3, 4]]))
+        targets = Tensor.from_numpy(np.array([[2, 3, 4, 5]]))
+
+        # Run a few steps
+        losses = []
+        for _ in range(5):
+            loss = trainer.train_step(input_ids, targets)
+            losses.append(loss)
+
+        assert all(np.isfinite(l) for l in losses)
+        # Verify avg_active is computed
+        avg_active = model.avg_active_experts()
+        assert avg_active > 0.0
+
+    def test_routing_mode_forward(self):
+        """Test forward pass with different routing modes."""
+        model = MoETransformer.tiny()
+        x = Tensor.from_numpy(np.array([[1, 2, 3, 4]]))
+
+        # TopK
+        model.set_routing_mode(RoutingMode.TOPK)
+        out_topk = model.forward(x)
+        assert out_topk.shape == (1, 4, 1000)
+
+        # BiasFree
+        model.set_routing_mode(RoutingMode.BIAS_FREE)
+        out_biasfree = model.forward(x)
+        assert out_biasfree.shape == (1, 4, 1000)
+
+        # ReLU
+        model.set_routing_mode(RoutingMode.RELU)
+        out_relu = model.forward(x)
+        assert out_relu.shape == (1, 4, 1000)

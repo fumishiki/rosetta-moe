@@ -6,21 +6,34 @@ Pure Python + NumPy implementation of a Mixture-of-Experts Transformer. No PyTor
 
 ## Architecture Overview
 
-```
+```text
 python/
-├── tensor.py      # Tensor class wrapping numpy arrays; matmul -> Accelerate BLAS
-├── config.py      # Model configuration dataclass (tiny benchmark + scalable variants)
-├── layers.py      # Embedding, RMSNorm, Linear, SwiGLU
-├── attention.py   # Multi-Query Attention with RoPE (NTK scaling)
-├── moe.py         # Router (top-k gating), MoELayer (vectorized dispatch), TransformerBlock
-├── model.py       # MoETransformer: full pipeline (embed -> blocks -> norm -> lm_head)
-├── generate.py    # Sampling strategies: greedy, temperature, top-k, top-p
-├── train.py       # AdamW optimizer, cross-entropy loss, LR schedule, grad clipping
-├── bench.py       # 5-axis benchmark harness (22 scenarios); JSON output to stdout
-├── __init__.py    # Package exports
+├── cpu/             # CPU implementation package (NumPy / Accelerate BLAS)
+│   ├── tensor.py
+│   ├── config.py
+│   ├── layers.py
+│   ├── attention.py
+│   ├── moe.py
+│   ├── model.py
+│   ├── generate.py
+│   └── train.py
+├── gpu/             # GPU implementation package (Metal / MPS via PyObjC)
+│   ├── metal_tensor.py
+│   ├── metal_layers.py
+│   ├── metal_attention.py
+│   ├── metal_moe.py
+│   ├── metal_model.py
+│   └── metal_train.py
+├── bench_cpu.py     # CPU benchmark harness (axes 1-5); JSON output to stdout
+├── bench_gpu.py     # GPU benchmark harness (axis 6, Metal/MPS); JSON output to stdout
+├── bench.py         # compatibility dispatcher (ROSETTA_CPU_ONLY / ROSETTA_GPU_ONLY)
+├── metal_backend.py # low-level Metal/MPS bridge
+├── __init__.py      # package facade (backward-compatible re-exports)
 └── tests/
     └── test_integration.py
 ```
+
+Bench paths import `python.cpu` / `python.gpu` only. Top-level modules (`python/tensor.py` etc.) remain as backward-compatible facades. `bench.py` is kept as a compatibility dispatcher (`ROSETTA_GPU_ONLY=1` for GPU, default CPU).
 
 ### Forward pipeline
 
@@ -38,27 +51,27 @@ token_ids [batch, seq]
 
 | Formula | File | Function/Method |
 |---------|------|-----------------|
-| `Embedding: out[i] = W[token_id[i]]` | `layers.py` | `Embedding.forward` |
-| `RMSNorm: y = x * (1/sqrt(mean(x^2) + eps)) * gamma` | `layers.py` | `RMSNorm.forward` |
-| `Linear: y = x @ W^T + b` | `layers.py` | `Linear.forward` |
-| `SiLU: y = x * sigmoid(x)` | `tensor.py` | `Tensor.silu` |
-| `SwiGLU: y = down(silu(gate(x)) * up(x))` | `layers.py` | `SwiGLU.forward` |
-| `Softmax: p_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))` | `tensor.py` | `Tensor.softmax` |
-| `RoPE: [x0,x1] -> [x0*cos(t) - x1*sin(t), x0*sin(t) + x1*cos(t)]` | `attention.py` | `MQAttention._apply_rope` |
-| `RoPE freq: f_i = 1 / (base^(2i/d))` | `attention.py` | `MQAttention._compute_rope_freqs` |
-| `NTK scaling: base' = base * alpha^(d/(d-2))` | `attention.py` | `MQAttention._compute_rope_freqs` |
-| `Attention: scores = Q@K^T/sqrt(d_k), weights = softmax(scores+mask), out = weights@V` | `attention.py` | `MQAttention.forward` |
-| `MoE: output = sum_k(gate_k * Expert_k(x))` | `moe.py` | `MoELayer.forward` |
-| `Router: probs = softmax(x@W), top_k -> renormalize` | `moe.py` | `Router.forward` |
-| `Aux loss: L = alpha * N * sum(f_i * P_i)` | `moe.py` | `Router.compute_aux_loss` |
-| `CrossEntropy: L = -mean(log(softmax(logits)[target]))` | `train.py` | `Trainer._compute_loss` |
-| `CE gradient: d_logits = softmax(logits) - one_hot(targets)` | `train.py` | `Trainer._compute_loss` |
-| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat/(sqrt(v_hat)+eps)+wd*w)` | `train.py` | `Trainer._adamw_step` |
-| `Grad clip: if \|\|g\|\|>c then g' = g*c/(\|\|g\|\|+eps)` | `train.py` | `clip_grad_by_global_norm` |
-| `LR warmup: lr = base_lr * step / warmup_steps` | `train.py` | `Trainer.get_lr` |
-| `LR cosine: lr = min_lr + 0.5*(base_lr-min_lr)*(1+cos(pi*progress))` | `train.py` | `Trainer.get_lr` |
-| `Temperature: p = softmax(logits / T)` | `generate.py` | `_sample_from_logits` |
-| `Top-p: accumulate sorted probs until sum >= p, renormalize` | `generate.py` | `_sample_top_p` |
+| `Embedding: out[i] = W[token_id[i]]` | `cpu/layers.py` | `Embedding.forward` |
+| `RMSNorm: y = x * (1/sqrt(mean(x^2) + eps)) * gamma` | `cpu/layers.py` | `RMSNorm.forward` |
+| `Linear: y = x @ W^T + b` | `cpu/layers.py` | `Linear.forward` |
+| `SiLU: y = x * sigmoid(x)` | `cpu/tensor.py` | `Tensor.silu` |
+| `SwiGLU: y = down(silu(gate(x)) * up(x))` | `cpu/layers.py` | `SwiGLU.forward` |
+| `Softmax: p_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))` | `cpu/tensor.py` | `Tensor.softmax` |
+| `RoPE: [x0,x1] -> [x0*cos(t) - x1*sin(t), x0*sin(t) + x1*cos(t)]` | `cpu/attention.py` | `MQAttention._apply_rope` |
+| `RoPE freq: f_i = 1 / (base^(2i/d))` | `cpu/attention.py` | `MQAttention._compute_rope_freqs` |
+| `NTK scaling: base' = base * alpha^(d/(d-2))` | `cpu/attention.py` | `MQAttention._compute_rope_freqs` |
+| `Attention: scores = Q@K^T/sqrt(d_k), weights = softmax(scores+mask), out = weights@V` | `cpu/attention.py` | `MQAttention.forward` |
+| `MoE: output = sum_k(gate_k * Expert_k(x))` | `cpu/moe.py` | `MoELayer.forward` |
+| `Router: probs = softmax(x@W), top_k -> renormalize` | `cpu/moe.py` | `Router.forward` |
+| `Aux loss: L = alpha * N * sum(f_i * P_i)` | `cpu/moe.py` | `Router.compute_aux_loss` |
+| `CrossEntropy: L = -mean(log(softmax(logits)[target]))` | `cpu/train.py` | `Trainer._compute_loss` |
+| `CE gradient: d_logits = softmax(logits) - one_hot(targets)` | `cpu/train.py` | `Trainer._compute_loss` |
+| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat/(sqrt(v_hat)+eps)+wd*w)` | `cpu/train.py` | `Trainer._adamw_step` |
+| `Grad clip: if \|\|g\|\|>c then g' = g*c/(\|\|g\|\|+eps)` | `cpu/train.py` | `clip_grad_by_global_norm` |
+| `LR warmup: lr = base_lr * step / warmup_steps` | `cpu/train.py` | `Trainer.get_lr` |
+| `LR cosine: lr = min_lr + 0.5*(base_lr-min_lr)*(1+cos(pi*progress))` | `cpu/train.py` | `Trainer.get_lr` |
+| `Temperature: p = softmax(logits / T)` | `cpu/generate.py` | `_sample_from_logits` |
+| `Top-p: accumulate sorted probs until sum >= p, renormalize` | `cpu/generate.py` | `_sample_top_p` |
 
 ## Implementation Notes
 
@@ -72,7 +85,7 @@ On macOS >= 14, NumPy links against Apple's Accelerate framework. All `np.matmul
 
 ### Vectorized MoE Dispatch
 
-The MoE layer (`moe.py:MoELayer.forward`) uses three key NumPy patterns:
+The MoE layer (`python/cpu/moe.py:MoELayer.forward`) uses three key NumPy patterns:
 
 - **`np.argpartition`** for O(N) top-k selection (vs O(N log N) full sort)
 - **Boolean mask broadcasting** (`indices_arr == expert_idx`) to find all tokens assigned to each expert in one vectorized operation
@@ -80,11 +93,11 @@ The MoE layer (`moe.py:MoELayer.forward`) uses three key NumPy patterns:
 
 ### tracemalloc Limitations
 
-`tracemalloc` (used in `bench.py`) only tracks allocations made through Python's memory allocator (`PyMem_Malloc` / `PyObject_Malloc`). NumPy array data is allocated via libc `malloc`, which tracemalloc does NOT see. The `alloc_bytes` metric in benchmarks significantly undercounts actual memory usage. Use `peak_rss_bytes` (from `resource.getrusage`) for a more accurate picture.
+`tracemalloc` (used in `bench_cpu.py`) only tracks allocations made through Python's memory allocator (`PyMem_Malloc` / `PyObject_Malloc`). NumPy array data is allocated via libc `malloc`, which tracemalloc does NOT see. The `alloc_bytes` metric in benchmarks significantly undercounts actual memory usage. Use `peak_rss_bytes` (from `resource.getrusage`) for a more accurate picture.
 
 ### ProcessPoolExecutor for Parallelism
 
-Python's GIL prevents true thread parallelism for CPU-bound code. The benchmark (`bench.py`) uses `ProcessPoolExecutor` to fork separate processes, each with its own GIL and its own model.
+Python's GIL prevents true thread parallelism for CPU-bound code. The CPU benchmark (`bench_cpu.py`) uses `ProcessPoolExecutor` to fork separate processes, each with its own GIL and its own model.
 
 The pool is created once with an `initializer=` callback that builds the model and input tensor in each worker process at startup. Warmup and trial loops only measure dispatch + forward pass time, not process creation overhead. The ~113ms fork/import cost is paid once at pool creation, not per trial.
 
@@ -145,6 +158,24 @@ All weights use Kaiming (He) normal initialization with `std = sqrt(2/fan_in)`, 
 
 The attention layer caches the causal mask (`_cached_mask`) keyed by sequence length. When `seq_len` changes between calls (e.g., during autoregressive generation where the sequence grows by 1 each step), the mask is regenerated. For fixed-length training, the mask is computed once and reused.
 
+## GPU (Metal/MPS)
+
+Requires macOS with Apple Silicon and PyObjC Metal bindings:
+
+```bash
+pip install pyobjc-framework-Metal pyobjc-framework-MetalPerformanceShaders
+```
+
+Run GPU benchmarks:
+```bash
+python3 bench_gpu.py
+```
+
+`bench_gpu.py` is a GPU-only path: benchmark loops avoid CPU↔GPU data transfers and host tensor views.
+
+The Metal backend (metal_backend.py) uses PyObjC to call Metal and MPS APIs.
+If PyObjC/Metal is unavailable, `bench_gpu.py` exits; use `bench_cpu.py` for CPU runs.
+
 ## Dependencies
 
 - Python 3.10+
@@ -160,8 +191,21 @@ cd python && pip install -e ".[dev]"
 # Run tests
 python3 -m pytest tests/ -v
 
-# Run benchmarks
-python3 bench.py > results.json
+# Run CPU benchmark
+python3 bench_cpu.py > results_cpu.json
+
+# Run GPU benchmark (Metal)
+python3 bench_gpu.py > results_gpu.json
+
+# Compatibility dispatcher (defaults to CPU)
+ROSETTA_GPU_ONLY=1 python3 bench.py > results_gpu_via_dispatcher.json
+
+# Override trials/warmup (defaults: 10/3)
+ROSETTA_BENCH_TRIALS=30 ROSETTA_BENCH_WARMUP=3 python3 bench_cpu.py
+
+# Project-root one-shot runs
+cd .. && make bench-all
+cd .. && make bench-all-30
 ```
 
 ```python

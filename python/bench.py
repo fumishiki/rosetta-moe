@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 # Copyright (c) 2025-2026 fumi-engineer
 
-"""CPU benchmark harness for Python MoE Transformer -- 5-axis design (22 scenarios).
+"""CPU benchmark harness for Python MoE Transformer -- 5-axis design (24 scenarios).
 
 Measures performance across five axes:
   1. Memory Management   -- training step, batch/seq scaling (11 scenarios)
   2. Compiler Optimization -- kernel micro-benchmarks: matmul, softmax, rmsnorm (3)
   3. Type System         -- warm vs cold dispatch overhead (2)
   4. Parallel            -- ProcessPoolExecutor scaling (1/2/4 workers) forward + train (6)
-  5. Scale Comparison    -- hidden=256 forward/train (2)
+  5. Scale Comparison    -- hidden=256/512 forward/train (4)
 
 Measurement methodology:
   - Wall time: time.perf_counter_ns (monotonic, ~ns resolution)
@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from python.config import Config
-from python.tensor import Tensor
+from python.tensor import Tensor, seed_rng
 from python.model import MoETransformer
 from python.train import Trainer, TrainConfig
 
@@ -253,6 +253,7 @@ def scenario_mem_train_step():
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         model = MoETransformer(Config.tiny())
         trainer = Trainer(model, TrainConfig.default())
         input_ids = _make_input(batch, seq)
@@ -282,6 +283,7 @@ def _scenario_mem_scale_batch(batch):
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         model = MoETransformer(Config.tiny())
         x = _make_input(batch, seq)
         return model, x
@@ -309,6 +311,7 @@ def _scenario_mem_scale_seq(seq):
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         model = MoETransformer(Config.tiny())
         x = _make_input(batch, seq)
         return model, x
@@ -447,6 +450,7 @@ def scenario_dispatch_warm():
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         model = MoETransformer(Config.tiny())
         x = _make_input(batch, seq)
         return model, x
@@ -478,11 +482,13 @@ def scenario_dispatch_cold():
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         x = _make_input(batch, seq)
         return (x,)
 
     def run(ctx):
         (x,) = ctx
+        seed_rng(SEED)  # Reset LCG before each model creation for consistency
         model = MoETransformer(Config.tiny())
         return model.forward(x)
 
@@ -504,6 +510,7 @@ def scenario_scale_forward_256():
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         model = MoETransformer(Config.small())
         x = _make_input(batch, seq)
         return model, x
@@ -530,7 +537,65 @@ def scenario_scale_train_256():
 
     def setup():
         np.random.seed(SEED)
+        seed_rng(SEED)
         model = MoETransformer(Config.small())
+        trainer = Trainer(model, TrainConfig.default())
+        input_ids = _make_input(batch, seq)
+        targets = _make_targets(batch, seq)
+        return trainer, input_ids, targets
+
+    def run(ctx):
+        trainer, input_ids, targets = ctx
+        loss = trainer.train_step(input_ids, targets)
+        return [loss]
+
+    result = _measure(setup, run, "scale_train_256")
+    result.update(
+        id="scale_train_256",
+        axis="scale",
+        params={"batch": batch, "seq_len": seq, "hidden_dim": 256},
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    _add_throughput(result, batch, seq)
+    return result
+
+
+def scenario_scale_forward_512():
+    """Benchmark forward pass with hidden=512 (scale comparison)."""
+    batch, seq = 2, 32
+
+    def setup():
+        np.random.seed(SEED)
+        seed_rng(SEED)
+        model = MoETransformer(Config.medium())
+        x = _make_input(batch, seq)
+        return model, x
+
+    def run(ctx):
+        model, x = ctx
+        return model.forward(x).flatten()
+
+    result = _measure(setup, run, "scale_forward_512")
+    result.update(
+        id="scale_forward_512",
+        axis="scale",
+        params={"batch": batch, "seq_len": seq, "hidden_dim": 512},
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    _add_throughput(result, batch, seq)
+    return result
+
+
+def scenario_scale_train_512():
+    """Benchmark training step with hidden=512 (scale comparison)."""
+    batch, seq = 2, 8
+
+    def setup():
+        np.random.seed(SEED)
+        seed_rng(SEED)
+        model = MoETransformer(Config.medium())
         trainer = Trainer(model, TrainConfig.default())
         input_ids = _make_input(batch, seq)
         targets = _make_targets(batch, seq)
@@ -540,11 +605,203 @@ def scenario_scale_train_256():
         trainer, input_ids, targets = ctx
         return trainer.train_step(input_ids, targets)
 
-    result = _measure(setup, run, "scale_train_256")
+    result = _measure(setup, run, "scale_train_512")
     result.update(
-        id="scale_train_256",
+        id="scale_train_512",
         axis="scale",
-        params={"batch": batch, "seq_len": seq, "hidden_dim": 256},
+        params={"batch": batch, "seq_len": seq, "hidden_dim": 512},
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    _add_throughput(result, batch, seq)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Axis 6: GPU (9 scenarios, runtime-gated)
+# ---------------------------------------------------------------------------
+
+
+def scenario_gpu_kernel_matmul():
+    """GPU MPS matmul 256x256."""
+    try:
+        from python.metal_backend import metal_available, MetalContext, MetalTensor, mps_matmul
+    except ImportError:
+        return None
+    if not metal_available():
+        return None
+
+    m, n, k = 256, 256, 256
+    ctx = MetalContext()
+    a_np = np.random.rand(m, k).astype(np.float32) * 0.01
+    b_np = np.random.rand(k, n).astype(np.float32) * 0.01
+
+    def setup():
+        a = MetalTensor.from_numpy(ctx, a_np)
+        b = MetalTensor.from_numpy(ctx, b_np)
+        c = MetalTensor(ctx, nbytes=m * n * 4, shape=[m, n])
+        return a, b, c
+
+    def run(ctx_tuple):
+        a, b, c = ctx_tuple
+        mps_matmul(ctx, a, b, c, m, n, k)
+        return c.to_numpy().ravel()
+
+    result = _measure(setup, run, "gpu_kernel_matmul")
+    median_sec = result["median_ns"] / 1e9
+    known_flops = 2 * m * n * k
+    gflops = (known_flops / median_sec / 1e9) if median_sec > 0 else 0.0
+    result["derived"]["gflops"] = gflops
+    result.update(
+        id="gpu_kernel_matmul",
+        axis="gpu",
+        params={"m": m, "n": n, "k": k},
+        known_flops=known_flops,
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    return result
+
+
+def scenario_gpu_kernel_softmax():
+    """GPU custom softmax kernel."""
+    try:
+        from python.metal_backend import metal_available, MetalContext, MetalTensor, dispatch_kernel
+    except ImportError:
+        return None
+    if not metal_available():
+        return None
+
+    n = 1000
+    ctx = MetalContext()
+
+    def setup():
+        data = np.random.rand(1, n).astype(np.float32)
+        inp = MetalTensor.from_numpy(ctx, data)
+        out = MetalTensor(ctx, nbytes=n * 4, shape=[1, n])
+        return inp, out
+
+    def run(ctx_tuple):
+        inp, out = ctx_tuple
+        dispatch_kernel(ctx, "softmax", [inp, out, n], grid_size=1, threadgroup_size=256)
+        return out.to_numpy().ravel()
+
+    result = _measure(setup, run, "gpu_kernel_softmax")
+    result.update(
+        id="gpu_kernel_softmax",
+        axis="gpu",
+        params={"n": n},
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    return result
+
+
+def scenario_gpu_kernel_rmsnorm():
+    """GPU custom rmsnorm kernel."""
+    try:
+        from python.metal_backend import metal_available, MetalContext, MetalTensor, dispatch_kernel
+    except ImportError:
+        return None
+    if not metal_available():
+        return None
+
+    rows, hidden = 2, 64
+    ctx = MetalContext()
+
+    def setup():
+        data = np.random.rand(rows, hidden).astype(np.float32)
+        weight = np.ones(hidden, dtype=np.float32)
+        inp = MetalTensor.from_numpy(ctx, data)
+        w = MetalTensor.from_numpy(ctx, weight)
+        out = MetalTensor(ctx, nbytes=rows * hidden * 4, shape=[rows, hidden])
+        return inp, w, out
+
+    def run(ctx_tuple):
+        inp, w, out = ctx_tuple
+        eps = 1e-6
+        dispatch_kernel(
+            ctx, "rmsnorm", [inp, out, w, hidden, eps], grid_size=rows, threadgroup_size=256
+        )
+        return out.to_numpy().ravel()
+
+    result = _measure(setup, run, "gpu_kernel_rmsnorm")
+    result.update(
+        id="gpu_kernel_rmsnorm",
+        axis="gpu",
+        params={"rows": rows, "hidden_dim": hidden},
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    return result
+
+
+def _gpu_forward_scenario(label, hidden_dim, cfg_method):
+    """GPU forward at given scale."""
+    try:
+        from python.metal_backend import metal_available
+    except ImportError:
+        return None
+    if not metal_available():
+        return None
+
+    batch, seq = 2, 32
+
+    def setup():
+        seed_rng(SEED)
+        cfg = cfg_method()
+        model = MoETransformer(cfg)
+        model.inference_mode = True
+        x = _make_input(batch, seq)
+        return model, x
+
+    def run(ctx_tuple):
+        model, x = ctx_tuple
+        return model.forward(x).data.ravel()
+
+    result = _measure(setup, run, f"gpu_forward_{label}")
+    result.update(
+        id=f"gpu_forward_{label}",
+        axis="gpu",
+        params={"batch": batch, "seq_len": seq, "hidden_dim": hidden_dim},
+        warmup_runs=N_WARMUP,
+        trial_runs=N_TRIALS,
+    )
+    _add_throughput(result, batch, seq)
+    return result
+
+
+def _gpu_train_scenario(label, hidden_dim, cfg_method):
+    """GPU train step at given scale."""
+    try:
+        from python.metal_backend import metal_available, gpu_train_step, MetalContext
+    except ImportError:
+        return None
+    if not metal_available():
+        return None
+
+    batch, seq = 2, 8
+
+    def setup():
+        seed_rng(SEED)
+        ctx = MetalContext()
+        cfg = cfg_method()
+        model = MoETransformer(cfg)
+        trainer = Trainer(model, TrainConfig.default())
+        x = _make_input(batch, seq)
+        t = _make_targets(batch, seq)
+        return ctx, trainer, x, t
+
+    def run(ctx_tuple):
+        ctx, trainer, x, t = ctx_tuple
+        loss = gpu_train_step(ctx, trainer, x, t)
+        return [loss]
+
+    result = _measure(setup, run, f"gpu_train_{label}")
+    result.update(
+        id=f"gpu_train_{label}",
+        axis="gpu",
+        params={"batch": batch, "seq_len": seq, "hidden_dim": hidden_dim},
         warmup_runs=N_WARMUP,
         trial_runs=N_TRIALS,
     )
@@ -568,6 +825,7 @@ def _parallel_init_worker(batch, seq_len, vocab, seed):
     """
     worker_seed = seed + os.getpid() % 1000
     np.random.seed(worker_seed)
+    seed_rng(worker_seed)
     model = MoETransformer(Config.tiny())
     b = np.arange(batch, dtype=np.float32)[:, None]
     s = np.arange(seq_len, dtype=np.float32)[None, :]
@@ -675,6 +933,7 @@ def _parallel_train_init_worker(batch, seq_len, vocab, seed):
     """Initializer for parallel training workers."""
     worker_seed = seed + os.getpid() % 1000
     np.random.seed(worker_seed)
+    seed_rng(worker_seed)
     model = MoETransformer(Config.tiny())
     trainer = Trainer(model, TrainConfig.default())
     input_ids = _make_input(batch, seq_len, vocab)
@@ -799,70 +1058,117 @@ def _metadata():
 
 
 def main():
-    _log("Python MoE Benchmark -- 5-axis (22 scenarios)")
+    cpu_only = os.environ.get("ROSETTA_CPU_ONLY") == "1"
+    gpu_only = os.environ.get("ROSETTA_GPU_ONLY") == "1"
+
+    if cpu_only and gpu_only:
+        raise RuntimeError("ROSETTA_CPU_ONLY and ROSETTA_GPU_ONLY cannot both be set")
+
+    # Enforce separated benchmark entrypoints:
+    # - CPU-only -> bench_cpu.py
+    # - GPU-only -> bench_gpu.py
+    # This avoids accidental mixed-path execution from bench.py.
+    if gpu_only:
+        script = os.path.join(os.path.dirname(__file__), "bench_gpu.py")
+        os.execv(sys.executable, [sys.executable, script])
+    if cpu_only:
+        script = os.path.join(os.path.dirname(__file__), "bench_cpu.py")
+        os.execv(sys.executable, [sys.executable, script])
+
+    _log("Python MoE Benchmark -- 24 CPU + 9 GPU scenarios")
+    total = 33
+
     np.random.seed(SEED)
 
     scenarios = []
-    total = 22
     idx = 0
 
-    # Axis 1: Memory Management (11 scenarios)
-    idx += 1
-    _log(f"[{idx}/{total}] mem_train_step")
-    scenarios.append(scenario_mem_train_step())
-
-    for bs in [1, 2, 4, 8]:
+    if not gpu_only:
+        # Axis 1: Memory Management (11 scenarios)
         idx += 1
-        _log(f"[{idx}/{total}] mem_scale_batch_{bs}")
-        scenarios.append(_scenario_mem_scale_batch(bs))
+        _log(f"[{idx}/{total}] mem_train_step")
+        scenarios.append(scenario_mem_train_step())
 
-    for sl in [8, 16, 32, 64]:
+        for bs in [1, 2, 4, 8]:
+            idx += 1
+            _log(f"[{idx}/{total}] mem_scale_batch_{bs}")
+            scenarios.append(_scenario_mem_scale_batch(bs))
+
+        for sl in [8, 16, 32, 64]:
+            idx += 1
+            _log(f"[{idx}/{total}] mem_scale_seq_{sl}")
+            scenarios.append(_scenario_mem_scale_seq(sl))
+
+        # Axis 2: Compiler Optimization (3 scenarios)
         idx += 1
-        _log(f"[{idx}/{total}] mem_scale_seq_{sl}")
-        scenarios.append(_scenario_mem_scale_seq(sl))
+        _log(f"[{idx}/{total}] kernel_matmul")
+        scenarios.append(scenario_kernel_matmul())
 
-    # Axis 2: Compiler Optimization (3 scenarios)
-    idx += 1
-    _log(f"[{idx}/{total}] kernel_matmul")
-    scenarios.append(scenario_kernel_matmul())
-
-    idx += 1
-    _log(f"[{idx}/{total}] kernel_softmax")
-    scenarios.append(scenario_kernel_softmax())
-
-    idx += 1
-    _log(f"[{idx}/{total}] kernel_rmsnorm")
-    scenarios.append(scenario_kernel_rmsnorm())
-
-    # Axis 3: Type System (2 scenarios)
-    idx += 1
-    _log(f"[{idx}/{total}] dispatch_warm")
-    scenarios.append(scenario_dispatch_warm())
-
-    idx += 1
-    _log(f"[{idx}/{total}] dispatch_cold")
-    scenarios.append(scenario_dispatch_cold())
-
-    # Axis 4: Parallel (3 scenarios)
-    for t in [1, 2, 4]:
         idx += 1
-        _log(f"[{idx}/{total}] parallel_T{t}")
-        scenarios.append(_scenario_parallel(t))
+        _log(f"[{idx}/{total}] kernel_softmax")
+        scenarios.append(scenario_kernel_softmax())
 
-    # Axis 4b: Parallel Training (3 scenarios)
-    for t in [1, 2, 4]:
         idx += 1
-        _log(f"[{idx}/{total}] parallel_train_T{t}")
-        scenarios.append(_scenario_parallel_train(t))
+        _log(f"[{idx}/{total}] kernel_rmsnorm")
+        scenarios.append(scenario_kernel_rmsnorm())
 
-    # Axis 5: Scale Comparison (2 scenarios)
-    idx += 1
-    _log(f"[{idx}/{total}] scale_forward_256")
-    scenarios.append(scenario_scale_forward_256())
+        # Axis 3: Type System (2 scenarios)
+        idx += 1
+        _log(f"[{idx}/{total}] dispatch_warm")
+        scenarios.append(scenario_dispatch_warm())
 
-    idx += 1
-    _log(f"[{idx}/{total}] scale_train_256")
-    scenarios.append(scenario_scale_train_256())
+        idx += 1
+        _log(f"[{idx}/{total}] dispatch_cold")
+        scenarios.append(scenario_dispatch_cold())
+
+        # Axis 4: Parallel (3 scenarios)
+        for t in [1, 2, 4]:
+            idx += 1
+            _log(f"[{idx}/{total}] parallel_T{t}")
+            scenarios.append(_scenario_parallel(t))
+
+        # Axis 4b: Parallel Training (3 scenarios)
+        for t in [1, 2, 4]:
+            idx += 1
+            _log(f"[{idx}/{total}] parallel_train_T{t}")
+            scenarios.append(_scenario_parallel_train(t))
+
+        # Axis 5: Scale Comparison (4 scenarios)
+        idx += 1
+        _log(f"[{idx}/{total}] scale_forward_256")
+        scenarios.append(scenario_scale_forward_256())
+
+        idx += 1
+        _log(f"[{idx}/{total}] scale_train_256")
+        scenarios.append(scenario_scale_train_256())
+
+        idx += 1
+        _log(f"[{idx}/{total}] scale_forward_512")
+        scenarios.append(scenario_scale_forward_512())
+
+        idx += 1
+        _log(f"[{idx}/{total}] scale_train_512")
+        scenarios.append(scenario_scale_train_512())
+
+    if not cpu_only:
+        # Axis 6: GPU (9 scenarios, runtime-gated)
+        gpu_scenarios = [
+            ("gpu_kernel_matmul", scenario_gpu_kernel_matmul),
+            ("gpu_kernel_softmax", scenario_gpu_kernel_softmax),
+            ("gpu_kernel_rmsnorm", scenario_gpu_kernel_rmsnorm),
+            ("gpu_forward_64", lambda: _gpu_forward_scenario("64", 64, Config.tiny)),
+            ("gpu_forward_256", lambda: _gpu_forward_scenario("256", 256, Config.small)),
+            ("gpu_forward_512", lambda: _gpu_forward_scenario("512", 512, Config.medium)),
+            ("gpu_train_64", lambda: _gpu_train_scenario("64", 64, Config.tiny)),
+            ("gpu_train_256", lambda: _gpu_train_scenario("256", 256, Config.small)),
+            ("gpu_train_512", lambda: _gpu_train_scenario("512", 512, Config.medium)),
+        ]
+        for name, fn in gpu_scenarios:
+            idx += 1
+            _log(f"[{idx}/{total}] {name}")
+            result_scenario = fn()
+            if result_scenario is not None:
+                scenarios.append(result_scenario)
 
     result = {
         "metadata": _metadata(),

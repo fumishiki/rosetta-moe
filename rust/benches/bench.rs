@@ -6,14 +6,15 @@
 //! Custom harness (not Criterion) to produce a standardized JSON output
 //! that is comparable across all 4 language implementations.
 //!
-//! 5 benchmark axes, 22 total scenarios:
+//! 5 benchmark axes, 24 CPU + 9 GPU scenarios:
 //! 1. **Memory Management** (9): train step, batch scaling [1,2,4,8], seq scaling [8,16,32,64]
 //! 2. **Compiler Optimization** (3): matmul, softmax, rmsnorm kernels
 //! 3. **Type System / Dispatch** (2): warm (reuse model), cold (fresh model each trial)
 //! 4. **Parallelism** (6): 1, 2, 4 threads running independent forward passes + train steps
-//! 5. **Scale Comparison** (2): forward and train at hidden=256 vs tiny hidden=64
+//! 5. **Scale Comparison** (4): forward and train at hidden=256, hidden=512 vs tiny hidden=64
+//! 6. **GPU** (9, feature-gated): MPS matmul, softmax, rmsnorm + forward/train at 3 scales
 //!
-//! Each scenario runs N_WARMUP warmup iterations + N_TRIALS timed iterations,
+//! Each scenario runs bench_warmup() warmup iterations + bench_trials() timed iterations,
 //! collecting wall-clock time, CPU time (user+sys), and allocation bytes.
 //!
 //! Allocation tracking: a custom global allocator (`CountingAlloc`) wraps the
@@ -26,9 +27,12 @@ use std::cell::Cell;
 use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use nn_core::{Config, DType, Layer, MoETransformer, RMSNorm, Shape, Tensor, TrainConfig, Trainer};
+#[cfg(feature = "metal")]
+use nn_core::{GpuModel, MetalContext, MetalTensor, dispatch_kernel, mps_matmul};
 
 thread_local! {
     static TL_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -59,8 +63,27 @@ static A: CountingAlloc = CountingAlloc;
 const SEED: u64 = 42;
 const VOCAB: usize = 1000;
 const HIDDEN: usize = 64;
-const N_TRIALS: usize = 10;
-const N_WARMUP: usize = 3;
+const DEFAULT_N_TRIALS: usize = 10;
+const DEFAULT_N_WARMUP: usize = 3;
+
+static BENCH_TRIALS: OnceLock<usize> = OnceLock::new();
+static BENCH_WARMUP: OnceLock<usize> = OnceLock::new();
+
+fn parse_env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn bench_trials() -> usize {
+    *BENCH_TRIALS.get_or_init(|| parse_env_usize("ROSETTA_BENCH_TRIALS", DEFAULT_N_TRIALS))
+}
+
+fn bench_warmup() -> usize {
+    *BENCH_WARMUP.get_or_init(|| parse_env_usize("ROSETTA_BENCH_WARMUP", DEFAULT_N_WARMUP))
+}
 
 fn make_token_ids(batch: usize, seq_len: usize, vocab: usize) -> Vec<usize> {
     (0..batch * seq_len).map(|i| i % vocab).collect()
@@ -298,7 +321,7 @@ fn scenario_json(
     batch_seq_tokens: Option<usize>,
     n_warmup_override: Option<usize>,
 ) -> String {
-    let warmup_runs = n_warmup_override.unwrap_or(N_WARMUP);
+    let warmup_runs = n_warmup_override.unwrap_or(bench_warmup());
     let (median_ns, p95_ns, min_ns, max_ns, iqr_ns) = stats(&m.timings_ns);
 
     let cpu_median_ns = {
@@ -410,12 +433,14 @@ fn bench_mem_train_step() -> String {
         total_steps: 100,
         grad_clip: 1.0,
         aux_loss_weight: 0.01,
+        z_loss_weight: 0.01,
+        ..Default::default()
     };
     let mut trainer = Trainer::new(model, train_cfg);
     let input = make_input_tensor(batch, seq, VOCAB);
     let targets = make_targets_tensor(batch, seq, VOCAB);
 
-    let m = measure(N_WARMUP, N_TRIALS, || {
+    let m = measure(bench_warmup(), bench_trials(), || {
         let _ = trainer.train_step(&input, &targets);
     });
 
@@ -446,7 +471,7 @@ fn bench_mem_scale_batch() -> Vec<String> {
         let ids = make_token_ids(b, seq, VOCAB);
         let mut last_output = None;
 
-        let m = measure(N_WARMUP, N_TRIALS, || {
+        let m = measure(bench_warmup(), bench_trials(), || {
             last_output = Some(model.forward_ids(&ids, b, seq));
         });
 
@@ -484,7 +509,7 @@ fn bench_mem_scale_seq() -> Vec<String> {
         let ids = make_token_ids(batch, s, VOCAB);
         let mut last_output = None;
 
-        let m = measure(N_WARMUP, N_TRIALS, || {
+        let m = measure(bench_warmup(), bench_trials(), || {
             last_output = Some(model.forward_ids(&ids, batch, s));
         });
 
@@ -521,14 +546,14 @@ fn bench_kernel_matmul() -> String {
     let n_dim = 64;
     // Matmul: C = A @ B, where A:[M,K], B:[K,N], C:[M,N]
     // FLOPs = 2*M*N*K = 2*64*64*64 = 524288 (multiply-add = 2 FLOPs)
-    let a = Tensor::randn(Shape::new(&[m_dim, k_dim]), DType::F32, SEED);
-    let b = Tensor::randn(Shape::new(&[k_dim, n_dim]), DType::F32, SEED + 1);
+    let a = Tensor::randn(Shape::new(&[m_dim, k_dim]), DType::F32);
+    let b = Tensor::randn(Shape::new(&[k_dim, n_dim]), DType::F32);
     // Pre-allocate output buffer OUTSIDE the timing loop to measure pure BLAS time.
     // Rust's try_matmul has overhead (batch_dims comparison, shape construction)
     // so we call sgemm directly for a fair kernel-level comparison with Go/Julia.
     let mut out = vec![0.0f32; m_dim * n_dim];
 
-    let meas = measure(N_WARMUP, N_TRIALS, || {
+    let meas = measure(bench_warmup(), bench_trials(), || {
         nn_core::sgemm(m_dim, n_dim, k_dim, 1.0, a.data(), b.data(), 0.0, &mut out);
     });
 
@@ -554,10 +579,10 @@ fn bench_kernel_matmul() -> String {
 fn bench_kernel_softmax() -> String {
     eprintln!("  [compiler] kernel_softmax");
     let n = 1000;
-    let input = Tensor::randn(Shape::new(&[1, n]), DType::F32, SEED);
+    let input = Tensor::randn(Shape::new(&[1, n]), DType::F32);
     let mut buf = vec![0.0f32; n];
 
-    let meas = measure(N_WARMUP, N_TRIALS, || {
+    let meas = measure(bench_warmup(), bench_trials(), || {
         buf.copy_from_slice(input.data());
         nn_core::softmax_in_place(&mut buf);
     });
@@ -584,11 +609,11 @@ fn bench_kernel_softmax() -> String {
 fn bench_kernel_rmsnorm() -> String {
     eprintln!("  [compiler] kernel_rmsnorm");
     let shape = [2, 32, HIDDEN];
-    let input = Tensor::randn(Shape::new(&shape), DType::F32, SEED);
+    let input = Tensor::randn(Shape::new(&shape), DType::F32);
     let mut norm = RMSNorm::new(HIDDEN);
     let mut last_output = None;
 
-    let meas = measure(N_WARMUP, N_TRIALS, || {
+    let meas = measure(bench_warmup(), bench_trials(), || {
         last_output = Some(norm.forward(&input));
     });
 
@@ -624,7 +649,7 @@ fn bench_dispatch_warm() -> String {
     let ids = make_token_ids(batch, seq, VOCAB);
     let mut last_output = None;
 
-    let m = measure(N_WARMUP, N_TRIALS, || {
+    let m = measure(bench_warmup(), bench_trials(), || {
         last_output = Some(model.forward_ids(&ids, batch, seq));
     });
 
@@ -656,7 +681,7 @@ fn bench_dispatch_cold() -> String {
 
     let mut last_output = None;
 
-    let m = measure(N_WARMUP, N_TRIALS, || {
+    let m = measure(bench_warmup(), bench_trials(), || {
         let cfg = Config::tiny();
         let mut model = MoETransformer::new(cfg);
         model.set_inference_mode(true);
@@ -696,7 +721,7 @@ fn bench_parallel() -> Vec<String> {
     let seq = 32;
     let ids = make_token_ids(batch, seq, VOCAB);
     let mut results = Vec::new();
-    let total_iters = N_WARMUP + N_TRIALS;
+    let total_iters = bench_warmup() + bench_trials();
 
     for &t in &thread_counts {
         eprintln!("  [parallel] parallel_T{t}");
@@ -716,9 +741,9 @@ fn bench_parallel() -> Vec<String> {
         // Per-thread alloc accumulators (written by workers, read by main)
         let thread_allocs: Vec<AtomicU64> = (0..t).map(|_| AtomicU64::new(0)).collect();
 
-        let mut warmup_timings_ns = Vec::with_capacity(N_WARMUP);
-        let mut timings_ns = Vec::with_capacity(N_TRIALS);
-        let mut cpu_times_ns = Vec::with_capacity(N_TRIALS);
+        let mut warmup_timings_ns = Vec::with_capacity(bench_warmup());
+        let mut timings_ns = Vec::with_capacity(bench_trials());
+        let mut cpu_times_ns = Vec::with_capacity(bench_trials());
         let mut total_alloc = 0u64;
 
         // One scope for entire scenario -- threads spawned ONCE, reused via barriers
@@ -757,7 +782,7 @@ fn bench_parallel() -> Vec<String> {
                 let wall_ns = start.elapsed().as_nanos() as u64;
                 let cpu_after = get_cpu_time_ns();
 
-                if iter < N_WARMUP {
+                if iter < bench_warmup() {
                     warmup_timings_ns.push(wall_ns);
                 } else {
                     timings_ns.push(wall_ns);
@@ -771,7 +796,7 @@ fn bench_parallel() -> Vec<String> {
             }
         }); // threads joined here (once)
 
-        let avg_alloc = total_alloc / N_TRIALS as u64;
+        let avg_alloc = total_alloc / bench_trials() as u64;
         let m = Measurement {
             timings_ns,
             cpu_times_ns,
@@ -806,7 +831,7 @@ fn bench_parallel_train() -> Vec<String> {
     let batch = 2;
     let seq = 8;
     let mut results = Vec::new();
-    let total_iters = N_WARMUP + N_TRIALS;
+    let total_iters = bench_warmup() + bench_trials();
 
     for &t in &thread_counts {
         eprintln!("  [parallel] parallel_train_T{t}");
@@ -825,6 +850,8 @@ fn bench_parallel_train() -> Vec<String> {
                     total_steps: 100,
                     grad_clip: 1.0,
                     aux_loss_weight: 0.01,
+                    z_loss_weight: 0.01,
+                    ..Default::default()
                 };
                 Mutex::new(Trainer::new(model, train_cfg))
             })
@@ -840,9 +867,9 @@ fn bench_parallel_train() -> Vec<String> {
 
         let thread_allocs: Vec<AtomicU64> = (0..t).map(|_| AtomicU64::new(0)).collect();
 
-        let mut warmup_timings_ns = Vec::with_capacity(N_WARMUP);
-        let mut timings_ns = Vec::with_capacity(N_TRIALS);
-        let mut cpu_times_ns = Vec::with_capacity(N_TRIALS);
+        let mut warmup_timings_ns = Vec::with_capacity(bench_warmup());
+        let mut timings_ns = Vec::with_capacity(bench_trials());
+        let mut cpu_times_ns = Vec::with_capacity(bench_trials());
         let mut total_alloc = 0u64;
 
         let barrier_go = Barrier::new(t + 1);
@@ -879,7 +906,7 @@ fn bench_parallel_train() -> Vec<String> {
                 let wall_ns = start.elapsed().as_nanos() as u64;
                 let cpu_after = get_cpu_time_ns();
 
-                if iter < N_WARMUP {
+                if iter < bench_warmup() {
                     warmup_timings_ns.push(wall_ns);
                 } else {
                     timings_ns.push(wall_ns);
@@ -893,7 +920,7 @@ fn bench_parallel_train() -> Vec<String> {
             }
         });
 
-        let avg_alloc = total_alloc / N_TRIALS as u64;
+        let avg_alloc = total_alloc / bench_trials() as u64;
         let m = Measurement {
             timings_ns,
             cpu_times_ns,
@@ -932,7 +959,7 @@ fn bench_scale_forward_256() -> String {
     let ids = make_token_ids(batch, seq, VOCAB);
     let mut last_output = None;
 
-    let m = measure(N_WARMUP, N_TRIALS, || {
+    let m = measure(bench_warmup(), bench_trials(), || {
         last_output = Some(model.forward_ids(&ids, batch, seq));
     });
 
@@ -970,12 +997,14 @@ fn bench_scale_train_256() -> String {
         total_steps: 100,
         grad_clip: 1.0,
         aux_loss_weight: 0.01,
+        z_loss_weight: 0.01,
+        ..Default::default()
     };
     let mut trainer = Trainer::new(model, train_cfg);
     let input = make_input_tensor(batch, seq, VOCAB);
     let targets = make_targets_tensor(batch, seq, VOCAB);
 
-    let m = measure(N_WARMUP, N_TRIALS, || {
+    let m = measure(bench_warmup(), bench_trials(), || {
         let _ = trainer.train_step(&input, &targets);
     });
 
@@ -994,11 +1023,281 @@ fn bench_scale_train_256() -> String {
     )
 }
 
+fn bench_scale_forward_512() -> String {
+    eprintln!("  [scale] scale_forward_512");
+    let batch = 2;
+    let seq = 32;
+    let mut model = MoETransformer::medium();
+    model.set_inference_mode(true);
+    let ids = make_token_ids(batch, seq, VOCAB);
+    let mut last_output = None;
+
+    let m = measure(bench_warmup(), bench_trials(), || {
+        last_output = Some(model.forward_ids(&ids, batch, seq));
+    });
+
+    let (nan, inf, ma) = match &last_output {
+        Some(t) => check_numerical(t),
+        None => (0, 0, 0.0),
+    };
+
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":512}}");
+    scenario_json(
+        "scale_forward_512",
+        "scale",
+        &params,
+        &m,
+        nan,
+        inf,
+        Some(ma),
+        None,
+        Some(batch * seq),
+        None,
+    )
+}
+
+fn bench_scale_train_512() -> String {
+    eprintln!("  [scale] scale_train_512");
+    let batch = 2;
+    let seq = 8;
+    let cfg = Config::medium();
+    let model = MoETransformer::new(cfg);
+    let train_cfg = TrainConfig {
+        batch_size: batch,
+        seq_len: seq,
+        lr: 1e-4,
+        warmup_steps: 0,
+        total_steps: 100,
+        grad_clip: 1.0,
+        aux_loss_weight: 0.01,
+        z_loss_weight: 0.01,
+        ..Default::default()
+    };
+    let mut trainer = Trainer::new(model, train_cfg);
+    let input = make_input_tensor(batch, seq, VOCAB);
+    let targets = make_targets_tensor(batch, seq, VOCAB);
+
+    let m = measure(bench_warmup(), bench_trials(), || {
+        let _ = trainer.train_step(&input, &targets);
+    });
+
+    let params = format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":512}}");
+    scenario_json(
+        "scale_train_512",
+        "scale",
+        &params,
+        &m,
+        0,
+        0,
+        None,
+        None,
+        Some(batch * seq),
+        None,
+    )
+}
+
+// ─── Axis 6: GPU (feature-gated) ────────────────────────────────────────────
+
+#[cfg(feature = "metal")]
+fn bench_gpu_scenarios() -> Vec<String> {
+    let mut ctx = match MetalContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  Metal not available: {e}");
+            return vec![];
+        }
+    };
+    if let Err(e) = ctx.load_required_shaders() {
+        eprintln!("  Failed to load Metal shaders: {e}");
+        return vec![];
+    }
+    let mut scenarios = Vec::new();
+
+    // gpu_kernel_matmul: MPS GEMM 256x256
+    {
+        eprintln!("  [gpu] gpu_kernel_matmul");
+        let m = 256;
+        let n = 256;
+        let k = 256;
+        let data_a: Vec<f32> = (0..m * k).map(|i| (i % 100) as f32 * 0.01).collect();
+        let data_b: Vec<f32> = (0..k * n).map(|i| (i % 100) as f32 * 0.01).collect();
+        let a = MetalTensor::upload(&ctx, &data_a, vec![m, k]).unwrap();
+        let b = MetalTensor::upload(&ctx, &data_b, vec![k, n]).unwrap();
+        let mut c = MetalTensor::zeros(&ctx, vec![m, n]).unwrap();
+        let result = measure(bench_warmup(), bench_trials(), || {
+            let _ = mps_matmul(&ctx, &a, &b, &mut c, m, n, k);
+        });
+        let flops = 2 * m * n * k;
+        scenarios.push(scenario_json(
+            "gpu_kernel_matmul",
+            "gpu",
+            &format!("{{\"m\":{m},\"n\":{n},\"k\":{k}}}"),
+            &result,
+            0,
+            0,
+            None,
+            Some(flops as u64),
+            None,
+            None,
+        ));
+    }
+
+    // gpu_kernel_softmax
+    {
+        eprintln!("  [gpu] gpu_kernel_softmax");
+        let n = 1000;
+        let data: Vec<f32> = (0..n).map(|i| i as f32 * 0.001).collect();
+        let input = MetalTensor::upload(&ctx, &data, vec![1, n]).unwrap();
+        let out = MetalTensor::zeros(&ctx, vec![1, n]).unwrap();
+        let n_buf = MetalTensor::from_u32_scalar(&ctx, n as u32).unwrap();
+        let result = measure(bench_warmup(), bench_trials(), || {
+            dispatch_kernel(&ctx, "softmax", &[&input, &out, &n_buf], &[], 256, 256).unwrap();
+        });
+        scenarios.push(scenario_json(
+            "gpu_kernel_softmax",
+            "gpu",
+            &format!("{{\"n\":{n}}}"),
+            &result,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    // gpu_kernel_rmsnorm
+    {
+        eprintln!("  [gpu] gpu_kernel_rmsnorm");
+        let rows = 2;
+        let hidden = 64;
+        let data: Vec<f32> = (0..rows * hidden).map(|i| i as f32 * 0.01).collect();
+        let input = MetalTensor::upload(&ctx, &data, vec![rows, hidden]).unwrap();
+        let out = MetalTensor::zeros(&ctx, vec![rows, hidden]).unwrap();
+        let weight = MetalTensor::upload(&ctx, &vec![1.0f32; hidden], vec![hidden]).unwrap();
+        let dim_buf = MetalTensor::from_u32_scalar(&ctx, hidden as u32).unwrap();
+        let eps_buf = MetalTensor::from_f32_scalar(&ctx, 1e-6).unwrap();
+        let result = measure(bench_warmup(), bench_trials(), || {
+            dispatch_kernel(
+                &ctx,
+                "rmsnorm",
+                &[&input, &out, &weight, &dim_buf, &eps_buf],
+                &[],
+                rows * 256,
+                256,
+            )
+            .unwrap();
+        });
+        scenarios.push(scenario_json(
+            "gpu_kernel_rmsnorm",
+            "gpu",
+            &format!("{{\"rows\":{rows},\"hidden_dim\":{hidden}}}"),
+            &result,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    // gpu_forward_64/256/512
+    for (label, cfg_fn) in [
+        ("64", Config::tiny as fn() -> Config),
+        ("256", Config::small as fn() -> Config),
+        ("512", Config::medium as fn() -> Config),
+    ] {
+        let id = format!("gpu_forward_{label}");
+        eprintln!("  [gpu] {id}");
+        let cfg = cfg_fn();
+        let hidden = cfg.hidden_dim;
+        let batch = 2;
+        let seq = 32;
+        let model = MoETransformer::new(cfg);
+        let gpu_model = GpuModel::from_cpu(&ctx, &model).unwrap();
+        let ids: Vec<f32> = (0..batch * seq).map(|i| (i % VOCAB) as f32).collect();
+        let input = MetalTensor::upload(&ctx, &ids, vec![batch, seq]).unwrap();
+        let result = measure(bench_warmup(), bench_trials(), || {
+            let _logits = nn_core::gpu_forward(&ctx, &gpu_model, &input).unwrap();
+        });
+        scenarios.push(scenario_json(
+            &id,
+            "gpu",
+            &format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{hidden}}}"),
+            &result,
+            0,
+            0,
+            None,
+            None,
+            Some(batch * seq),
+            None,
+        ));
+    }
+
+    // gpu_train_64/256/512
+    for (label, cfg_fn) in [
+        ("64", Config::tiny as fn() -> Config),
+        ("256", Config::small as fn() -> Config),
+        ("512", Config::medium as fn() -> Config),
+    ] {
+        let id = format!("gpu_train_{label}");
+        eprintln!("  [gpu] {id}");
+        let cfg = cfg_fn();
+        let hidden = cfg.hidden_dim;
+        let batch = 2;
+        let seq = 8;
+        let model = MoETransformer::new(cfg);
+        let gpu_model = GpuModel::from_cpu(&ctx, &model).unwrap();
+        let ids: Vec<f32> = (0..batch * seq).map(|i| (i % VOCAB) as f32).collect();
+        let tgt: Vec<f32> = (0..batch * seq).map(|i| ((i + 1) % VOCAB) as f32).collect();
+        let input = MetalTensor::upload(&ctx, &ids, vec![batch, seq]).unwrap();
+        let targets = MetalTensor::upload(&ctx, &tgt, vec![batch, seq]).unwrap();
+        let result = measure(bench_warmup(), bench_trials(), || {
+            let _loss = nn_core::gpu_train_step_no_readback(&ctx, &gpu_model, &input, &targets).unwrap();
+        });
+        scenarios.push(scenario_json(
+            &id,
+            "gpu",
+            &format!("{{\"batch\":{batch},\"seq_len\":{seq},\"hidden_dim\":{hidden}}}"),
+            &result,
+            0,
+            0,
+            None,
+            None,
+            Some(batch * seq),
+            None,
+        ));
+    }
+
+    scenarios
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    eprintln!("Rust MoE Transformer Benchmark (5-axis, 22 scenarios)");
-    eprintln!("=====================================================");
+    let cpu_only = std::env::var("ROSETTA_CPU_ONLY").unwrap_or_default() == "1";
+    let gpu_only = std::env::var("ROSETTA_GPU_ONLY").unwrap_or_default() == "1";
+    let backend = if gpu_only {
+        "gpu_metal"
+    } else if cpu_only {
+        "cpu"
+    } else {
+        "mixed"
+    };
+
+    if cpu_only && gpu_only {
+        eprintln!("ROSETTA_CPU_ONLY and ROSETTA_GPU_ONLY cannot both be set");
+        std::process::exit(2);
+    } else if gpu_only {
+        eprintln!("Rust MoE Transformer Benchmark (GPU-only mode)");
+    } else if cpu_only {
+        eprintln!("Rust MoE Transformer Benchmark (CPU-only mode)");
+    } else {
+        eprintln!("Rust MoE Transformer Benchmark (24 CPU + 9 GPU scenarios)");
+    }
+    eprintln!("==========================================================");
 
     let rust_version = match std::process::Command::new("rustc")
         .arg("--version")
@@ -1013,29 +1312,44 @@ fn main() {
 
     let mut scenario_jsons: Vec<String> = Vec::new();
 
-    // Axis 1: Memory Management (9 scenarios)
-    scenario_jsons.push(bench_mem_train_step());
-    scenario_jsons.extend(bench_mem_scale_batch()); // 4
-    scenario_jsons.extend(bench_mem_scale_seq()); // 4
+    if !gpu_only {
+        // Axis 1: Memory Management (9 scenarios)
+        scenario_jsons.push(bench_mem_train_step());
+        scenario_jsons.extend(bench_mem_scale_batch()); // 4
+        scenario_jsons.extend(bench_mem_scale_seq()); // 4
 
-    // Axis 2: Compiler Optimization (3 scenarios)
-    scenario_jsons.push(bench_kernel_matmul());
-    scenario_jsons.push(bench_kernel_softmax());
-    scenario_jsons.push(bench_kernel_rmsnorm());
+        // Axis 2: Compiler Optimization (3 scenarios)
+        scenario_jsons.push(bench_kernel_matmul());
+        scenario_jsons.push(bench_kernel_softmax());
+        scenario_jsons.push(bench_kernel_rmsnorm());
 
-    // Axis 3: Type System (2 scenarios)
-    scenario_jsons.push(bench_dispatch_warm());
-    scenario_jsons.push(bench_dispatch_cold());
+        // Axis 3: Type System (2 scenarios)
+        scenario_jsons.push(bench_dispatch_warm());
+        scenario_jsons.push(bench_dispatch_cold());
 
-    // Axis 4: Parallel (3 scenarios)
-    scenario_jsons.extend(bench_parallel());
+        // Axis 4: Parallel (3 scenarios)
+        scenario_jsons.extend(bench_parallel());
 
-    // Axis 4: Parallel Training (3 scenarios)
-    scenario_jsons.extend(bench_parallel_train());
+        // Axis 4: Parallel Training (3 scenarios)
+        scenario_jsons.extend(bench_parallel_train());
 
-    // Axis 5: Scale Comparison (2 scenarios)
-    scenario_jsons.push(bench_scale_forward_256());
-    scenario_jsons.push(bench_scale_train_256());
+        // Axis 5: Scale Comparison (4 scenarios)
+        scenario_jsons.push(bench_scale_forward_256());
+        scenario_jsons.push(bench_scale_train_256());
+        scenario_jsons.push(bench_scale_forward_512());
+        scenario_jsons.push(bench_scale_train_512());
+    }
+
+    if !cpu_only {
+        // Axis 6: GPU (9 scenarios, feature-gated)
+        #[cfg(feature = "metal")]
+        {
+            eprintln!("\n=== Axis 6: GPU ===");
+            let gpu_scenarios = bench_gpu_scenarios();
+            eprintln!("  {} GPU scenarios collected.", gpu_scenarios.len());
+            scenario_jsons.extend(gpu_scenarios);
+        }
+    }
 
     eprintln!("  done. {} scenarios collected.", scenario_jsons.len());
 
@@ -1044,6 +1358,7 @@ fn main() {
             "{{",
             "\"metadata\":{{",
             "\"language\":\"rust\",",
+            "\"backend\":\"{backend}\",",
             "\"language_version\":\"{ver}\",",
             "\"os\":\"{os}\",",
             "\"cpu_model\":\"{cpu}\",",
@@ -1056,11 +1371,12 @@ fn main() {
             "}}"
         ),
         ver = escape_json_string(&rust_version),
+        backend = backend,
         os = escape_json_string(&os_info),
         cpu = escape_json_string(&cpu_model),
         ts = escape_json_string(&timestamp),
-        n_trials = N_TRIALS,
-        n_warmup = N_WARMUP,
+        n_trials = bench_trials(),
+        n_warmup = bench_warmup(),
         seed = SEED,
         scenarios = scenario_jsons.join(","),
     );

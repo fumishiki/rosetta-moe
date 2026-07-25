@@ -2,7 +2,7 @@
 
 # Rust MoE Transformer (`nn-core`)
 
-Educational CPU-only Mixture-of-Experts Transformer in Rust, built on Apple Accelerate BLAS. Part of a 4-language (Rust, Julia, Go, Python) benchmark suite comparing language characteristics for ML workloads.
+Educational Mixture-of-Experts Transformer in Rust with explicit CPU/GPU separation. CPU kernels use Apple Accelerate BLAS, and GPU paths are provided via Metal. Part of a 4-language (Rust, Julia, Go, Python) benchmark suite comparing language characteristics for ML workloads.
 
 ## Architecture Overview
 
@@ -10,69 +10,75 @@ Educational CPU-only Mixture-of-Experts Transformer in Rust, built on Apple Acce
 
 ```
 rust/
-├── Cargo.toml              # Crate config: [lib] + [[bin]] for bench
+├── Cargo.toml              # Crate config: [lib] + [[bin]] (bench/convergence)
 ├── src/
 │   ├── lib.rs              # Public API facade (sole export boundary)
-│   ├── tensor.rs           # Tensor type, shape, matmul, softmax
 │   ├── config.rs           # Model hyperparameter configs
-│   ├── layers.rs           # Embedding, RMSNorm, Linear, SwiGLU
-│   ├── attention.rs        # Multi-Query Attention with RoPE
-│   ├── moe.rs              # Router, MoELayer, TransformerBlock
-│   ├── model.rs            # Full MoETransformer model
-│   ├── generate.rs         # Sampling strategies + generation loop
-│   ├── train.rs            # CrossEntropyLoss, AdamW, Trainer, checkpointing
-│   ├── simd.rs             # NEON SIMD intrinsics (fast rsqrt, AdamW vectorized step)
-│   └── accelerate.rs       # Apple Accelerate BLAS FFI (cblas_sgemm)
+│   ├── cpu/
+│   │   ├── tensor.rs       # CPU tensor + matmul/softmax kernels
+│   │   ├── layers.rs       # Embedding, RMSNorm, Linear, SwiGLU
+│   │   ├── attention.rs    # Multi-Query Attention with RoPE
+│   │   ├── moe.rs          # Router, MoELayer, TransformerBlock
+│   │   ├── model.rs        # CPU MoETransformer
+│   │   ├── generate.rs     # CPU sampling/generation
+│   │   ├── train.rs        # CPU training (AdamW, CE, clipping)
+│   │   ├── simd.rs         # NEON SIMD intrinsics
+│   │   └── accelerate.rs   # Apple Accelerate BLAS FFI
+│   └── gpu/
+│       ├── metal_tensor.rs # Metal tensor/buffer wrappers
+│       ├── metal_layers.rs # Metal kernels (softmax/rmsnorm/etc.)
+│       ├── metal_model.rs  # GPU model forward path
+│       └── metal_train.rs  # GPU train proxy/update path
 └── benches/
-    └── bench.rs            # 5-axis benchmark harness (22 scenarios)
+    └── bench.rs            # Unified benchmark harness (CPU+GPU, up to 33 scenarios)
 ```
 
 ### Dependency DAG
 
 ```
 lib.rs (facade)
-  ├── model.rs
-  │     ├── generate.rs
-  │     ├── layers.rs ──────── tensor.rs, simd.rs
-  │     ├── moe.rs
-  │     │     ├── attention.rs ── layers.rs
-  │     │     └── layers.rs
-  │     └── config.rs
-  ├── train.rs ──── model.rs, layers.rs, tensor.rs, simd.rs
-  ├── simd.rs (leaf: no internal deps, only NEON intrinsics)
-  └── accelerate.rs (leaf: no internal deps, only C FFI)
+  ├── cpu::model
+  │     ├── cpu::generate
+  │     ├── cpu::layers ──────── cpu::tensor, cpu::simd
+  │     ├── cpu::moe
+  │     │     ├── cpu::attention ── cpu::layers
+  │     │     └── cpu::layers
+  │     └── config
+  ├── cpu::train ──── cpu::model, cpu::layers, cpu::tensor, cpu::simd
+  └── gpu::{metal_tensor, metal_layers, metal_model, metal_train}
 
 benches/bench.rs ── nn_core (uses lib.rs public API)
 ```
 
-Data flows downward: `model -> moe -> attention -> layers -> tensor -> accelerate`. No circular dependencies.
+CPU data flow: `cpu::model -> cpu::moe -> cpu::attention -> cpu::layers -> cpu::tensor -> cpu::accelerate`. GPU data flow is isolated under `src/gpu/*`.
+`benches/bench.rs` supports split execution with `ROSETTA_CPU_ONLY=1` / `ROSETTA_GPU_ONLY=1` (both set is an error).
 
 ## Equation-to-Code Map
 
 | Math Formula | File | Function/Location |
 |---|---|---|
-| `Softmax: p_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))` | `tensor.rs` | `softmax_into_slice`, `softmax_in_place`, `Tensor::softmax_into` |
-| `SiLU: silu(x) = x / (1 + exp(-x))` | `tensor.rs` | `Tensor::silu` |
-| `Matmul: C = A @ B` (batched) | `tensor.rs` | `Tensor::try_matmul` -> `accelerate::sgemm` |
-| `Box-Muller: z = sqrt(-2*ln(u1)) * cos(2*pi*u2)` | `tensor.rs` | `Tensor::randn` |
-| `Embedding: out = W[token_id, :]` | `layers.rs` | `Embedding::forward_with_ids` |
-| `RMSNorm: y = x * (1/sqrt(mean(x^2) + eps)) * gamma` | `layers.rs` | `RMSNorm::forward` |
-| `Linear: Y = X @ W^T` | `layers.rs` | `Linear::forward` -> `accelerate::sgemm_transb` |
-| `Linear backward: dX = dY @ W` | `layers.rs` | `Linear::backward` -> `accelerate::sgemm` |
-| `SwiGLU: out = Down(SiLU(Gate(x)) * Up(x))` | `layers.rs` | `SwiGLU::forward` |
-| `RoPE: [x0,x1] -> [x0*cos(t) - x1*sin(t), x0*sin(t) + x1*cos(t)]` | `attention.rs` | `MQAttention::apply_rope` |
-| `Attention: scores = Q@K^T/sqrt(d_k), out = softmax(scores+mask)@V` | `attention.rs` | `MQAttention::forward` |
-| `MoE: output = sum_k(gate_k * Expert_k(x))` for top-k | `moe.rs` | `MoELayer::forward` |
-| `Router: probs = softmax(x @ W), top-k select + renormalize` | `moe.rs` | `Router::route` |
-| `Aux Loss: L = alpha * N * sum_e(f_e * p_e)` | `moe.rs` | `MoELayer::aux_loss`, `compute_aux_loss` |
-| `Cross-entropy: L = -(1/N) * sum(log(softmax(logits)[target]))` | `train.rs` | `CrossEntropyLoss::forward` |
-| `CE gradient: dL = (1/N) * (softmax(logits) - one_hot(target))` | `train.rs` | `CrossEntropyLoss::backward` |
-| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat*rsqrt(v_hat+eps)+wd*w)` | `train.rs` | `AdamW::step` -> `simd::adamw_step_simd` |
-| `Fast rsqrt: 1/sqrt(x) ≈ vrsqrteq_f32(x) * (1.5 - 0.5*x*est*est)` | `simd.rs` | `fast_rsqrt_slice` |
-| `Gradient clipping: g = g * clip/norm if norm > clip` | `train.rs` | `clip_grad_by_global_norm_inplace` |
-| `Cosine LR: lr = min_lr + 0.5*(lr-min_lr)*(1+cos(pi*progress))` | `train.rs` | `Trainer::get_lr` |
-| `Temperature sampling: p = softmax(logits / T)` | `generate.rs` | `sample_from_logits` |
-| `Top-p (nucleus): keep smallest set with cumulative prob >= p` | `generate.rs` | `sample_top_p` |
+| `Softmax: p_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))` | `src/cpu/tensor.rs` | `softmax_into_slice`, `softmax_in_place`, `Tensor::softmax_into` |
+| `SiLU: silu(x) = x / (1 + exp(-x))` | `src/cpu/tensor.rs` | `Tensor::silu` |
+| `Matmul: C = A @ B` (batched) | `src/cpu/tensor.rs` | `Tensor::try_matmul` -> `accelerate::sgemm` |
+| `Box-Muller: z = sqrt(-2*ln(u1)) * cos(2*pi*u2)` | `src/cpu/tensor.rs` | `Tensor::randn` |
+| `Embedding: out = W[token_id, :]` | `src/cpu/layers.rs` | `Embedding::forward_with_ids` |
+| `RMSNorm: y = x * (1/sqrt(mean(x^2) + eps)) * gamma` | `src/cpu/layers.rs` | `RMSNorm::forward` |
+| `Linear: Y = X @ W^T` | `src/cpu/layers.rs` | `Linear::forward` -> `accelerate::sgemm_transb` |
+| `Linear backward: dX = dY @ W` | `src/cpu/layers.rs` | `Linear::backward` -> `accelerate::sgemm` |
+| `SwiGLU: out = Down(SiLU(Gate(x)) * Up(x))` | `src/cpu/layers.rs` | `SwiGLU::forward` |
+| `RoPE: [x0,x1] -> [x0*cos(t) - x1*sin(t), x0*sin(t) + x1*cos(t)]` | `src/cpu/attention.rs` | `MQAttention::apply_rope` |
+| `Attention: scores = Q@K^T/sqrt(d_k), out = softmax(scores+mask)@V` | `src/cpu/attention.rs` | `MQAttention::forward` |
+| `MoE: output = sum_k(gate_k * Expert_k(x))` for top-k | `src/cpu/moe.rs` | `MoELayer::forward` |
+| `Router: probs = softmax(x @ W), top-k select + renormalize` | `src/cpu/moe.rs` | `Router::route` |
+| `Aux Loss: L = alpha * N * sum_e(f_e * p_e)` | `src/cpu/moe.rs` | `MoELayer::aux_loss`, `compute_aux_loss` |
+| `Cross-entropy: L = -(1/N) * sum(log(softmax(logits)[target]))` | `src/cpu/train.rs` | `CrossEntropyLoss::forward` |
+| `CE gradient: dL = (1/N) * (softmax(logits) - one_hot(target))` | `src/cpu/train.rs` | `CrossEntropyLoss::backward` |
+| `AdamW: m=b1*m+(1-b1)*g, v=b2*v+(1-b2)*g^2, w-=lr*(m_hat*rsqrt(v_hat+eps)+wd*w)` | `src/cpu/train.rs` | `AdamW::step` -> `simd::adamw_step_simd` |
+| `Fast rsqrt: 1/sqrt(x) ≈ vrsqrteq_f32(x) * (1.5 - 0.5*x*est*est)` | `src/cpu/simd.rs` | `fast_rsqrt_slice` |
+| `Gradient clipping: g = g * clip/norm if norm > clip` | `src/cpu/train.rs` | `clip_grad_by_global_norm_inplace` |
+| `Cosine LR: lr = min_lr + 0.5*(lr-min_lr)*(1+cos(pi*progress))` | `src/cpu/train.rs` | `Trainer::get_lr` |
+| `Temperature sampling: p = softmax(logits / T)` | `src/cpu/generate.rs` | `sample_from_logits` |
+| `Top-p (nucleus): keep smallest set with cumulative prob >= p` | `src/cpu/generate.rs` | `sample_top_p` |
 
 ## Implementation Notes
 
@@ -86,15 +92,15 @@ Tensor owns its data via `Vec<f32>`. Key patterns:
 
 ### BLAS FFI Pattern
 
-All matrix multiplications route through `accelerate.rs`, which wraps `cblas_sgemm` from Apple's Accelerate framework (uses AMX coprocessor on Apple Silicon):
+All matrix multiplications route through `src/cpu/accelerate.rs`, which wraps `cblas_sgemm` from Apple's Accelerate framework (uses AMX coprocessor on Apple Silicon):
 
 ```
-rust/src/accelerate.rs
+rust/src/cpu/accelerate.rs
   #[link(name = "Accelerate", kind = "framework")]
   extern "C" { fn cblas_sgemm(...) }
 ```
 
-- **Safety boundary**: `#![deny(unsafe_code)]` at crate root; only `accelerate.rs` and `simd.rs` have `#![allow(unsafe_code)]`. In `accelerate.rs`, all unsafe is in two functions: `sgemm` and `sgemm_transb`. In `simd.rs`, unsafe is confined to NEON intrinsic calls (`vrsqrteq_f32`, `vld1q_f32`, `vst1q_f32`, etc.) with documented SAFETY invariants per block.
+- **Safety boundary**: `#![deny(unsafe_code)]` at crate root; only `src/cpu/accelerate.rs` and `src/cpu/simd.rs` have `#![allow(unsafe_code)]`. In `src/cpu/accelerate.rs`, all unsafe is in two functions: `sgemm` and `sgemm_transb`. In `src/cpu/simd.rs`, unsafe is confined to NEON intrinsic calls (`vrsqrteq_f32`, `vld1q_f32`, `vst1q_f32`, etc.) with documented SAFETY invariants per block.
 - **Framework linking**: `#[link(name = "Accelerate", kind = "framework")]` tells the linker to use `-framework Accelerate`. No build.rs or pkg-config needed on macOS.
 - **SAFETY invariants** (documented in each unsafe block):
   1. Slice bounds verified by `debug_assert!(a.len() >= m*k)` etc.
@@ -110,7 +116,7 @@ rust/src/accelerate.rs
 
 **Rule of thumb**: If you just built the data with `vec![...]` or `.collect()`, use `from_vec`. If you're extracting a sub-slice from an existing tensor's data, use `from_slice`.
 
-Example in `moe.rs`: Each token chunk is a borrowed slice of the input tensor, so `from_slice` is required:
+Example in `src/cpu/moe.rs`: Each token chunk is a borrowed slice of the input tensor, so `from_slice` is required:
 ```rust
 // chunk borrows input.data() -- must copy
 let token = Tensor::from_slice(chunk, Shape::new(&[1, 1, hidden]));
@@ -126,11 +132,11 @@ This pattern is critical in hot loops (attention score computation) where alloca
 
 ### NEON SIMD Optimization
 
-The `simd.rs` module provides NEON intrinsic-based fast paths for two hot loops:
+The `src/cpu/simd.rs` module provides NEON intrinsic-based fast paths for two hot loops:
 
 1. **AdamW inner loop** (`adamw_step_simd`): Processes 4 parameters per cycle using NEON vector registers. The key optimization replaces `m_hat / (sqrt(v_hat) + eps)` with `m_hat * rsqrt(v_hat + eps)`, avoiding the expensive scalar `sqrt()` call. The rsqrt uses `vrsqrteq_f32` (~12-bit hardware estimate) + one Newton-Raphson refinement (`vrsqrtsq_f32`) for ~23-bit accuracy.
 
-2. **RMSNorm normalization** (`fast_rsqrt_slice`): Computes `1/sqrt(mean(x^2) + eps)` using the same approximate rsqrt path, called from `layers.rs::RMSNorm::forward`.
+2. **RMSNorm normalization** (`fast_rsqrt_slice`): Computes `1/sqrt(mean(x^2) + eps)` using the same approximate rsqrt path, called from `src/cpu/layers.rs::RMSNorm::forward`.
 
 This matches Julia's `@fastmath` approach, which lowers to ARM NEON `frsqrte` + Newton-Raphson. Both have `#[cfg(not(target_arch = "aarch64"))]` scalar fallbacks for non-ARM targets. Tail elements (when length is not a multiple of 4) also use scalar fallback.
 
@@ -221,6 +227,21 @@ The `RefCell` in `MoELayer::last_route` makes the entire model `!Sync`. For the 
 
 The max-subtraction trick (`exp(x - max(x))`) prevents overflow, but the denominator can still be zero if all inputs are `-inf` (happens with causal masking when softmax is applied to a single element). The `sum.max(1e-12)` clamp prevents `1/0 = inf` from propagating.
 
+## GPU (Metal/MPS)
+
+Requires macOS with Apple Silicon. Build with Metal feature:
+
+```bash
+cargo build --release --features metal
+cargo run --release --features metal --bin bench
+# GPU-only benchmark JSON
+ROSETTA_GPU_ONLY=1 cargo run --release --features metal --bin bench
+```
+
+The Metal backend uses a C/Objective-C bridge (metal-bridge/) compiled via `cc` crate.
+GPU benchmarks are feature-gated and only included when `--features metal` is specified.
+Timed GPU scenarios avoid host readback in the hot path (for example `gpu_train_step_no_readback`).
+
 ## Build & Run
 
 ```bash
@@ -230,6 +251,13 @@ cargo test
 # Release build
 cargo build --release
 
-# Run benchmarks (outputs JSON to stdout)
-cargo run --release --bin bench
+# CPU-only benchmark JSON
+ROSETTA_CPU_ONLY=1 cargo run --release --bin bench
+
+# Override trials/warmup (defaults: 10/3)
+ROSETTA_BENCH_TRIALS=30 ROSETTA_BENCH_WARMUP=3 ROSETTA_CPU_ONLY=1 cargo run --release --bin bench
+
+# Project-root one-shot runs
+cd .. && make bench-all
+cd .. && make bench-all-30
 ```

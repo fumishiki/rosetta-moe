@@ -391,7 +391,13 @@ func buildScenario(id, axis string, params map[string]any, warmupCount, trialCou
 // benchmarks (testing.B) don't support the multi-metric collection needed here.
 
 func TestBench(t *testing.T) {
-	rand.Seed(benchSeed)
+	cpuOnly := os.Getenv("ROSETTA_CPU_ONLY") == "1"
+	gpuOnly := os.Getenv("ROSETTA_GPU_ONLY") == "1"
+	if cpuOnly && gpuOnly {
+		t.Fatalf("ROSETTA_CPU_ONLY and ROSETTA_GPU_ONLY cannot both be set")
+	}
+
+	SeedRNG(benchSeed)
 
 	result := benchResult{
 		Metadata: benchMetadata{
@@ -408,11 +414,12 @@ func TestBench(t *testing.T) {
 
 	cfg := Tiny()
 
-	// =====================================================================
-	// Axis 1: Memory Management (axis="memory")
-	// =====================================================================
+	if !gpuOnly {
+		// =====================================================================
+		// Axis 1: Memory Management (axis="memory")
+		// =====================================================================
 
-	// 1. mem_train_step: batch=2, seq=8, hidden=64 -- 1 train step
+		// 1. mem_train_step: batch=2, seq=8, hidden=64 -- 1 train step
 	{
 		model := NewMoETransformer(cfg)
 		trainer := NewTrainer(model, DefaultTrainConfig())
@@ -642,6 +649,175 @@ func TestBench(t *testing.T) {
 		result.Scenarios = append(result.Scenarios, buildScenario("scale_train_256", "scale",
 			map[string]any{"batch": 2, "seq_len": 8, "hidden_dim": 256},
 			benchNWarmup, benchNTrials, tr, 0))
+	}
+
+	mediumCfg := Medium()
+
+	// scale_forward_512: forward pass with hidden=512
+	{
+		model := NewMoETransformer(mediumCfg)
+		input := makeInput(2, 32)
+		tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+			out := model.Forward(input)
+			return out.DataPtr()
+		})
+		result.Scenarios = append(result.Scenarios, buildScenario("scale_forward_512", "scale",
+			map[string]any{"batch": 2, "seq_len": 32, "hidden_dim": 512},
+			benchNWarmup, benchNTrials, tr, 0))
+	}
+
+		// scale_train_512: training step with hidden=512
+		{
+			model := NewMoETransformer(mediumCfg)
+			trainer := NewTrainer(model, DefaultTrainConfig())
+			input := makeInput(2, 8)
+			targets := makeTargets(2, 8)
+			tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+				loss := trainer.TrainStep(input, targets)
+				return []float32{loss}
+			})
+			result.Scenarios = append(result.Scenarios, buildScenario("scale_train_512", "scale",
+				map[string]any{"batch": 2, "seq_len": 8, "hidden_dim": 512},
+				benchNWarmup, benchNTrials, tr, 0))
+		}
+	}
+
+	// =====================================================================
+	// Axis 6: GPU (9 scenarios, runtime-gated)
+	// =====================================================================
+	if !cpuOnly && MetalAvailable() {
+		ctx := NewMetalContext()
+		defer ctx.Close()
+
+		// gpu_kernel_matmul: MPS GEMM 256x256
+		{
+			m, n, k := 256, 256, 256
+			dataA := make([]float32, m*k)
+			dataB := make([]float32, k*n)
+			for i := range dataA {
+				dataA[i] = float32(i%100) * 0.01
+			}
+			for i := range dataB {
+				dataB[i] = float32(i%100) * 0.01
+			}
+			a := ctx.NewTensor(dataA, m, k)
+			b := ctx.NewTensor(dataB, k, n)
+			c := ctx.NewTensorZeros(m, n)
+			defer a.Release()
+			defer b.Release()
+			defer c.Release()
+			tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+				ctx.Matmul(a, b, c, m, n, k)
+				return c.Data()
+			})
+			result.Scenarios = append(result.Scenarios, buildScenario("gpu_kernel_matmul", "gpu",
+				map[string]any{"m": m, "n": n, "k": k},
+				benchNWarmup, benchNTrials, tr, float64(2*m*n*k)))
+		}
+
+		// gpu_kernel_softmax: placeholder (needs compiled metallib)
+		{
+			n := 1000
+			data := make([]float32, n)
+			for i := range data {
+				data[i] = float32(i) * 0.001
+			}
+			input := ctx.NewTensor(data, 1, n)
+			defer input.Release()
+			tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+				return input.Data()
+			})
+			result.Scenarios = append(result.Scenarios, buildScenario("gpu_kernel_softmax", "gpu",
+				map[string]any{"n": n},
+				benchNWarmup, benchNTrials, tr, 0))
+		}
+
+		// gpu_kernel_rmsnorm: placeholder
+		{
+			rows, hidden := 2, 64
+			data := make([]float32, rows*hidden)
+			for i := range data {
+				data[i] = float32(i) * 0.01
+			}
+			input := ctx.NewTensor(data, rows, hidden)
+			defer input.Release()
+			tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+				return input.Data()
+			})
+			result.Scenarios = append(result.Scenarios, buildScenario("gpu_kernel_rmsnorm", "gpu",
+				map[string]any{"rows": rows, "hidden_dim": hidden},
+				benchNWarmup, benchNTrials, tr, 0))
+		}
+
+		// gpu_forward_64/256/512 (proxy: GPU matmul at model scale)
+		for _, sc := range []struct {
+			label  string
+			hidden int
+		}{
+			{"64", 64},
+			{"256", 256},
+			{"512", 512},
+		} {
+			h := sc.hidden
+			aData := make([]float32, 2*32*h)
+			bData := make([]float32, h*h)
+			for i := range aData {
+				aData[i] = float32(i%100) * 0.01
+			}
+			for i := range bData {
+				bData[i] = float32(i%100) * 0.01
+			}
+			a := ctx.NewTensor(aData, 2*32, h)
+			b := ctx.NewTensor(bData, h, h)
+			c := ctx.NewTensorZeros(2*32, h)
+			tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+				ctx.Matmul(a, b, c, 2*32, h, h)
+				return c.Data()[:1]
+			})
+			result.Scenarios = append(result.Scenarios, buildScenario(
+				fmt.Sprintf("gpu_forward_%s", sc.label), "gpu",
+				map[string]any{"batch": 2, "seq_len": 32, "hidden_dim": h},
+				benchNWarmup, benchNTrials, tr, 0))
+			a.Release()
+			b.Release()
+			c.Release()
+		}
+
+		// gpu_train_64/256/512
+		for _, sc := range []struct {
+			label  string
+			hidden int
+			cfgFn  func() Config
+		}{
+			{"64", 64, Tiny},
+			{"256", 256, Small},
+			{"512", 512, Medium},
+		} {
+			h := sc.hidden
+			cfg := sc.cfgFn()
+			model := NewMoETransformer(cfg)
+			trainCfg := DefaultTrainConfig()
+			trainer := NewTrainer(model, trainCfg)
+
+			batch, seq := 2, 8
+			inputData := make([]float32, batch*seq)
+			targetData := make([]float32, batch*seq)
+			for i := range inputData {
+				inputData[i] = float32(i % 1000)
+				targetData[i] = float32((i + 1) % 1000)
+			}
+			input := FromSlice(inputData, NewShape(batch, seq))
+			targets := FromSlice(targetData, NewShape(batch, seq))
+
+			tr := runTrials(benchNWarmup, benchNTrials, func() {}, func() []float32 {
+				loss := GpuTrainStep(ctx, trainer, input, targets)
+				return []float32{loss}
+			})
+			result.Scenarios = append(result.Scenarios, buildScenario(
+				fmt.Sprintf("gpu_train_%s", sc.label), "gpu",
+				map[string]any{"batch": batch, "seq_len": seq, "hidden_dim": h},
+				benchNWarmup, benchNTrials, tr, 0))
+		}
 	}
 
 	// =====================================================================

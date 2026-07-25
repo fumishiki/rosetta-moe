@@ -10,9 +10,16 @@ using Random
 using Printf
 
 function main()
-    Random.seed!(42)
+    seed_val = 42
+    for i in 1:length(ARGS)
+        if ARGS[i] == "--seed" && i < length(ARGS)
+            seed_val = parse(Int, ARGS[i+1])
+        end
+    end
+    Random.seed!(seed_val)
+    seed_rng!(seed_val)
     model = tiny_model()
-    cfg = TrainConfig(1f-3, 0.9f0, 0.95f0, 1f-8, 0.1f0, 1f0, 10, 1200, 0.01f0)
+    cfg = TrainConfig(1f-3, 0.9f0, 0.95f0, 1f-8, 0.1f0, 0.5f0, 50, 600, 0.01f0, 0.05f0, TopKMode, 0.001f0, 0.01f0, 2)
     trainer = Trainer(model, cfg)
 
     batch, seq = 2, 8
@@ -21,7 +28,7 @@ function main()
     input = from_array(reshape(input_data, batch, seq))
     targets = from_array(reshape(target_data, batch, seq))
 
-    n_steps = 1000
+    n_steps = 500
     losses = Float32[]
     for _ in 1:n_steps
         push!(losses, train_step!(trainer, input, targets))

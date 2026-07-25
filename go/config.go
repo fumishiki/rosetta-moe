@@ -32,6 +32,12 @@ func Small() Config {
 	return Config{256, 2, 4, 1, 4, 2, 1000, 512, 1024, 64, 10000, 1}
 }
 
+// Medium returns a config with hidden=512 for scale comparison benchmarks.
+// Same structure as Small but 2x larger hidden dimension.
+func Medium() Config {
+	return Config{512, 2, 8, 4, 4, 2, 1000, 512, 2048, 64, 10000, 1}
+}
+
 // TotalParams estimates the total parameter count across ALL experts.
 //   total = embedding + N_layers * (attention + router + N_experts * FFN + 2*norm) + lm_head
 func (c Config) TotalParams() int {

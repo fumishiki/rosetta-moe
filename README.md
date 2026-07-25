@@ -9,7 +9,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
 ![Julia](https://img.shields.io/badge/Julia-1.10+-purple)
 
-**Same MoE Transformer. 4 languages. 22 benchmark scenarios. One hardware.**
+**Same MoE Transformer. 4 languages. 33 benchmark scenarios. One hardware.**
 
 Rust, Go, Python, Julia — each implements the same MoE Transformer from scratch (forward, backward, optimizer, inference). All matmul hits the same Apple Accelerate BLAS on the same M1. No ML frameworks — every gradient is hand-derived.
 
@@ -51,13 +51,32 @@ Training scaling is lower than inference for Rust/Julia because backward pass in
 
 </details>
 
-Full results with 22 scenarios across 5 axes: [`docs/bench-results.md`](docs/bench-results.md)
+Full results with 33 scenarios across 6 axes (24 CPU + 9 GPU): [`docs/bench-results.md`](docs/bench-results.md)
+
+## GPU Results (Metal/MPS)
+
+| | MPS matmul 256² (ms) | GPU Forward 512 (ms) | Crossover |
+|---|---|---|---|
+| **Rust** | _pending_ | _pending_ | _pending_ |
+| **Julia** | _pending_ | _pending_ | _pending_ |
+| **Go** | _pending_ | _pending_ | _pending_ |
+| **Python** | _pending_ | _pending_ | _pending_ |
+
+GPU benchmarks use Apple Metal Performance Shaders (MPS) for GEMM and custom MSL kernels for softmax/rmsnorm/silu. All measurements on M1 unified memory (zero-copy CPU↔GPU).
+
+Run GPU benchmarks:
+```bash
+make bench-gpu     # all 4 languages with Metal
+```
 
 ## Quick Start
 
 ```bash
 make test          # test all 4 languages
-make bench         # benchmark + summary table
+make bench-cpu     # CPU benchmark (4 languages)
+make bench-gpu     # GPU benchmark (requires Metal)
+make bench-all     # CPU/GPU benchmark sweep (8 runs, sequential)
+make bench-all-30  # same as bench-all, fixed 30 trials
 make convergence   # verify loss convergence
 make convergence-plots  # run each language + render convergence demo GIF
 ```
@@ -73,7 +92,9 @@ make verify
 
 ```bash
 make test-rust / make test-go / make test-python / make test-julia
-make bench-rust / make bench-julia
+make bench-cpu-rust / make bench-cpu-go / make bench-cpu-python / make bench-cpu-julia
+make bench-gpu-rust / make bench-gpu-go / make bench-gpu-python / make bench-gpu-julia
+make bench-all / make bench-all-30
 
 # First-time setup
 cd python && pip install -e ".[dev]" && cd ..
@@ -99,7 +120,7 @@ cd julia && julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ..
 | Workload | Full MoE Transformer (fwd + bwd + opt) | Toy algorithms | Framework-level API | Cherry-picked microbenchmarks |
 | BLAS control | All languages share same BLAS (Apple Accelerate) | N/A | Each framework bundles own BLAS | Uncontrolled |
 | GC analysis | `gc_throughput`, pause count, per-scenario instrumentation | None | None | "Rust has no GC" (hand-wave) |
-| Methodology | 5 axes, 22 scenarios, N=10 median, literature-backed metrics | Single metric | Wall time only | Single run |
+| Methodology | 6 axes, 33 scenarios, median (default N=10), literature-backed metrics | Single metric | Wall time only | Single run |
 | Parallel model | std::thread / goroutine / ProcessPool / Threads.@threads | Varies | Framework-managed | Rarely tested |
 | Reproducibility | Fixed seed, fixed input, getrusage, JSON output | Varies | Docker-dependent | Not reproducible |
 | Math traceability | 21-entry equation-to-code map per language | None | None | None |
@@ -391,13 +412,13 @@ Cross-platform runs are possible for some tasks, but published benchmark numbers
 | Python | 3.13.5 + NumPy (Accelerate-linked) |
 | Julia | 1.12.4 + AppleAccelerate.jl |
 | BLAS | Apple Accelerate (AMX, ~1.49 TFLOPS f32 theoretical peak) |
-| Methodology | N=10 trials, 3 warmup, median reported, fixed seed (42) |
+| Methodology | Default: N=10 trials, 3 warmup, median, fixed seed (42). Override via `BENCH_TRIALS` / `BENCH_WARMUP` (or `ROSETTA_BENCH_TRIALS` / `ROSETTA_BENCH_WARMUP`) |
 
 ## Known Limitations
 
 - **Small model size**: hidden=64 amplifies per-call overhead. At hidden=256, BLAS share already grows significantly (see [Scaling Behavior](#scaling-behavior) above).
 - **Single hardware**: Apple M1 only. Results may differ on x86 (no AMX), NVIDIA GPU, or different Apple Silicon generations.
-- **CPU only**: No GPU benchmarks. At scale, GPU compute (A100: ~312 TFLOPS f32) dwarfs CPU (~1.5 TFLOPS).
+- **GPU section still in progress**: GPU harness exists and can run (`make bench-gpu` / `make bench-all`), but several tables still contain pending placeholders.
 - **alloc_bytes not comparable**: Each language measures allocation differently. Use `peak_rss_bytes` for cross-language comparison.
 
 ## Project Structure
@@ -419,12 +440,12 @@ rosetta-moe/
 │   └── convergence_plots.py      # Sequential run + animated demo generation
 ├── docs/
 │   ├── spec.md                       # Spec: requirements and acceptance criteria
-│   ├── bench-results.md              # Full benchmark report (22 scenarios)
+│   ├── bench-results.md              # Full benchmark report (33 scenarios)
 │   ├── convergence-revision-history.md # Detailed optimization/change history
 │   └── assets/convergence/
 │       └── convergence-demo.gif      # README demo animation
 ├── .github/workflows/     # CI
-├── Makefile              # make test / make bench / make convergence / make convergence-plots / make verify
+├── Makefile              # make test / make bench-cpu / make bench-gpu / make bench-all / make bench-all-30 / make verify
 └── Cargo.toml
 ```
 

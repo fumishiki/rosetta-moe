@@ -11,9 +11,47 @@ package nn
 import (
 	"fmt"
 	"math"
-	"math/rand"
 	"strings"
 )
+
+// Global LCG state for reproducible weight initialization (matches Rust/Python/Julia).
+var lcgState uint64 = 42
+
+// SeedRNG sets the global LCG state for reproducible weight initialization.
+func SeedRNG(seed uint64) {
+	lcgState = seed
+	lcgNormalHasCache = false
+}
+
+// lcgUniform returns a uniform random float64 in [1e-10, 1.0] using Knuth's MMIX LCG.
+// Same constants as generate.go sampling, tensor init in Rust/Python/Julia.
+func lcgUniform() float64 {
+	lcgState = lcgState*6364136223846793005 + 1
+	u := float64(lcgState) / float64(^uint64(0))
+	if u < 1e-10 {
+		u = 1e-10
+	}
+	return u
+}
+
+// lcgNormal returns a standard normal sample using Box-Muller transform + LCG.
+// Produces values in pairs internally but returns one at a time using a cache.
+var lcgNormalCache float64
+var lcgNormalHasCache bool
+
+func lcgNormal() float64 {
+	if lcgNormalHasCache {
+		lcgNormalHasCache = false
+		return lcgNormalCache
+	}
+	u1 := lcgUniform()
+	u2 := lcgUniform()
+	r := math.Sqrt(-2.0 * math.Log(u1))
+	theta := 2.0 * math.Pi * u2
+	lcgNormalHasCache = true
+	lcgNormalCache = r * math.Sin(theta)
+	return r * math.Cos(theta)
+}
 
 // DType enumerates supported data types. Only F32 is used at runtime;
 // the others exist for future mixed-precision support.
@@ -364,7 +402,7 @@ func FromSliceNoCopy(data []float32, shape Shape) *Tensor {
 func Randn(shape Shape, dtype DType) *Tensor {
 	t := New(shape, dtype)
 	for i := range t.data {
-		t.data[i] = float32(rand.NormFloat64())
+		t.data[i] = float32(lcgNormal())
 	}
 	return t
 }
@@ -373,7 +411,7 @@ func Randn(shape Shape, dtype DType) *Tensor {
 func RandnWithStd(shape Shape, dtype DType, std float32) *Tensor {
 	t := New(shape, dtype)
 	for i := range t.data {
-		t.data[i] = float32(rand.NormFloat64()) * std
+		t.data[i] = float32(lcgNormal()) * std
 	}
 	return t
 }

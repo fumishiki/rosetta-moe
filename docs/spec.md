@@ -90,20 +90,20 @@ These requirements ensure the four implementations are functionally equivalent �
 
 ### 5.3 Architecture and Hyperparameter Profile
 
-| Item | Tiny (benchmark) | Full (default_6_9b) |
-|---|---|---|
-| Layers | 2 | 30 |
-| Hidden dim | 64 | 768 |
-| Vocab size | 1,000 | 32,000 |
-| Experts / top-k | 4 / 2 | 16 / 4 |
-| Attention | 4 Q / 1 KV | 12 Q / 1 KV |
-| Head dim | 16 | 64 |
-| FFN dim | 256 | 6,144 |
-| Max seq len | 512 | 32,768 |
-| RoPE base / alpha | 10,000 / 1.0 | 10,000 / 8.0 |
-| Precision | float32 | float32 |
+| Item | Tiny (benchmark) | Small (scale) | Medium (GPU) | Full (default_6_9b) |
+|---|---|---|---|---|
+| Layers | 2 | 2 | 2 | 30 |
+| Hidden dim | 64 | 256 | 512 | 768 |
+| Vocab size | 1,000 | 1,000 | 1,000 | 32,000 |
+| Experts / top-k | 4 / 2 | 4 / 2 | 4 / 2 | 16 / 4 |
+| Attention | 4 Q / 1 KV | 4 Q / 1 KV | 8 Q / 4 KV | 12 Q / 1 KV |
+| Head dim | 16 | 64 | 64 | 64 |
+| FFN dim | 256 | 1,024 | 2,048 | 6,144 |
+| Max seq len | 512 | 512 | 512 | 32,768 |
+| RoPE base / alpha | 10,000 / 1.0 | 10,000 / 1.0 | 10,000 / 1.0 | 10,000 / 8.0 |
+| Precision | float32 | float32 | float32 | float32 |
 
-The evaluation matrix spans 5 axes:
+The evaluation matrix spans 6 axes:
 
 | Axis | Focus | Scenarios |
 |------|-------|-----------|
@@ -111,9 +111,10 @@ The evaluation matrix spans 5 axes:
 | 2. Compiler | Raw kernel optimization (BLAS baseline) | 3 (matmul, softmax, rmsnorm) |
 | 3. Type System | Dispatch mechanisms (cold vs warm) | 2 (cold, warm) |
 | 4. Parallel | Concurrency scaling (no shared state) | 6 (inference×3 + train×3) |
-| 5. Scale | Convergence at larger model | 2 (forward + train at hidden=256) |
+| 5. Scale | Convergence at larger model | 4 (forward/train at h=256 and h=512) |
+| 6. GPU | Metal Performance Shaders (MPS) on M1 | 9 (kernels×3 + forward×3 + train×3) |
 
-The **Tiny** profile is used for all benchmarks — small enough to run 10 trials with warmup in seconds, yet large enough to exercise every code path (MoE routing, GQA attention, SwiGLU gating). The **Full** profile is the reference architecture at real-world scale: 6.9B total parameters with 1.8B active per token via MoE top-k routing. It exists to verify that implementations handle realistic dimensions without overflow or shape errors, but is not benchmarked.
+The **Tiny** profile is used for all CPU benchmarks — small enough to run 10 trials with warmup in seconds, yet large enough to exercise every code path (MoE routing, GQA attention, SwiGLU gating). The **Small** profile (h=256) tests CPU scaling to larger hidden dimensions where BLAS dominates. The **Medium** profile (h=512) introduces GQA (n_kv_heads=4 < n_heads=8) and tests GPU viability at non-trivial scale on M1 unified memory architecture. The **Full** profile is the reference architecture at real-world scale: 6.9B total parameters with 1.8B active per token via MoE top-k routing. It exists to verify that implementations handle realistic dimensions without overflow or shape errors, but is not benchmarked.
 
 ### 5.4 Training System Requirements (MUST/SHOULD)
 
@@ -132,11 +133,11 @@ The **Tiny** profile is used for all benchmarks — small enough to run 10 trial
 - Distributed training or production-scale data
 - Vendor-specific backend tuning
 
-## 6. Evaluation Matrix — 4 Research Axes
+## 6. Evaluation Matrix — 6 Research Axes
 
-Performance evaluation is structured around 4 orthogonal axes that isolate distinct language/runtime characteristics. Non-performance evaluation (correctness) follows.
+Performance evaluation is structured around 6 orthogonal axes that isolate distinct language/runtime characteristics. Non-performance evaluation (correctness) follows.
 
-The 4-axis design ensures each axis isolates ONE language characteristic — memory model, compiler optimization, type system dispatch, or concurrency scaling — so that observed performance differences can be attributed to a specific language feature rather than confounded across multiple factors. By keeping workloads small and targeted per axis, we avoid the "everything is different" problem that plagues most cross-language comparisons.
+The 6-axis design ensures each axis isolates ONE language characteristic — memory model, compiler optimization, type system dispatch, concurrency scaling, scale convergence, or GPU viability — so that observed performance differences can be attributed to a specific language feature rather than confounded across multiple factors. By keeping workloads small and targeted per axis, we avoid the "everything is different" problem that plagues most cross-language comparisons.
 
 ### Metric Design Principles
 
@@ -224,12 +225,14 @@ How well does each language's concurrency model scale? This axis runs independen
 
 ### 6.5 Axis 5: Scale (Hidden Dimension Convergence)
 
-Do language differences persist at larger model sizes? This axis measures forward pass and training step at hidden=256 (4× the benchmark config) to observe performance convergence as BLAS fraction grows. If BLAS dominates at larger sizes, all languages should converge toward similar times.
+Do language differences persist at larger model sizes? This axis measures forward pass and training step at hidden=256 and hidden=512 to observe performance convergence as BLAS fraction grows. If BLAS dominates at larger sizes, all languages should converge toward similar times.
 
 | Scenario | Workload | Parameters |
 |----------|----------|------------|
 | scale_forward_256 | Full forward pass | batch=2, seq=32, hidden=256 |
 | scale_train_256 | 1 train step (fwd + bwd + opt) | batch=2, seq=8, hidden=256 |
+| scale_forward_512 | Full forward pass | batch=2, seq=32, hidden=512 |
+| scale_train_512 | 1 train step (fwd + bwd + opt) | batch=2, seq=8, hidden=512 |
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -237,7 +240,26 @@ Do language differences persist at larger model sizes? This axis measures forwar
 | cpu_time_ns | measured | User + system CPU time |
 | throughput | derived | Tokens/sec |
 
-### 6.6 Correctness
+### 6.6 Axis 6: GPU (MPS Metal Backend)
+
+Does offloading compute to the M1 GPU via Metal Performance Shaders improve throughput? This axis measures GPU forward pass and training step across three scales (h=64, 256, 512) to find the CPU↔GPU crossover point. On M1's unified memory architecture, data transfer cost is theoretically zero — but kernel launch overhead and Metal command encoding may dominate at small sizes.
+
+| Scenario | Workload | Parameters |
+|----------|----------|------------|
+| gpu_kernel_matmul | MPS GEMM at 64/256/512 | M=K=N varied |
+| gpu_kernel_softmax | Custom MSL softmax | n=1000 |
+| gpu_kernel_rmsnorm | Custom MSL rmsnorm | shape=(2,32,64) |
+| gpu_forward_{64,256,512} | Full forward pass (GPU) | batch=2, seq=32 |
+| gpu_train_{64,256,512} | Full train step (GPU) | batch=2, seq=8 |
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| median_ns | measured | Median wall-clock time (includes GPU sync) |
+| cpu_time_ns | measured | CPU time (setup + encoding overhead) |
+| peak_rss | measured | Memory including GPU shared buffers |
+| gpu_speedup | derived | `cpu_median_ns / gpu_median_ns` — per scenario |
+
+### 6.7 Correctness
 
 | Category | Metric |
 |---|---|
@@ -250,14 +272,15 @@ Do language differences persist at larger model sizes? This axis measures forwar
 
 ### Environment Control
 
-- Same machine, local CPU only
+- Same machine, local CPU/GPU on Apple Silicon (GPU axis requires Metal)
 - Fixed OS and compiler/interpreter versions recorded in result metadata
 - Fixed seed (42) and fixed input fixtures
-- N_TRIALS=10, N_WARMUP=3, median reported with IQR
+- Default `N_TRIALS=10`, `N_WARMUP=3`, median reported with IQR
+  (`ROSETTA_BENCH_TRIALS` / `ROSETTA_BENCH_WARMUP` override supported)
 
-Median with IQR is chosen over mean with stddev because system benchmarks are prone to outliers (background daemons, thermal throttling, GC storms). Median is robust to these — a single 10x outlier does not skew the result. N=10 trials provides a stable median for CPU-only workloads; 3 warmup iterations eliminate JIT compilation latency (Julia), CPU cache cold-start effects, and lazy initialization overhead across all languages.
+Median with IQR is chosen over mean with stddev because system benchmarks are prone to outliers (background daemons, thermal throttling, GC storms). Median is robust to these — a single 10x outlier does not skew the result. Default N=10 trials provides a stable median for CPU workloads; 3 warmup iterations eliminate JIT compilation latency (Julia), CPU cache cold-start effects, and lazy initialization overhead across all languages.
 
-### Scenario Groups (5 Axes)
+### Scenario Groups (6 Axes)
 
 1. **Axis 1 — Memory Management** (9 scenarios):
    mem_train_step + mem_scale_batch_{1,2,4,8} + mem_scale_seq_{8,16,32,64}
@@ -267,10 +290,12 @@ Median with IQR is chosen over mean with stddev because system benchmarks are pr
    dispatch_warm + dispatch_cold
 4. **Axis 4 — Parallel Model** (6 scenarios):
    parallel_T{1,2,4} + parallel_train_T{1,2,4}
-5. **Axis 5 — Scale** (2 scenarios):
-   scale_forward_256 + scale_train_256
+5. **Axis 5 — Scale** (4 scenarios):
+   scale_forward_{256,512} + scale_train_{256,512}
+6. **Axis 6 — GPU** (9 scenarios):
+   gpu_kernel_{matmul,softmax,rmsnorm} + gpu_forward_{64,256,512} + gpu_train_{64,256,512}
 
-Total: 22 scenarios (max batch=8, max seq=64).
+Total: 24 CPU scenarios + 9 GPU scenarios = 33 scenarios (max batch=8, max seq=64).
 
 ### Reporting
 
@@ -312,7 +337,7 @@ Mandatory deliverables:
 ## 10. Acceptance Criteria
 
 1. All four implementations pass shared correctness scenarios.
-2. CPU benchmark runs are reproducible from documented commands.
+2. CPU/GPU benchmark runs are reproducible from documented commands.
 3. GC and memory metrics are collected and published in a comparable format.
 4. Numerical stability checks pass under predefined stress inputs.
 5. Scaling and parallel efficiency results are published with raw data.
@@ -350,14 +375,18 @@ Completed artifacts:
 
 Phase 2 (DONE):
 
-- Benchmark harness implemented per language (`python/bench.py`, `rust/src/bin/bench.rs`, `go/bench_test.go`, `julia/bench.jl`)
+- Benchmark harness implemented per language
+  (`python/bench_cpu.py` + `python/bench_gpu.py`,
+   `rust/benches/bench.rs`,
+   `go/cpu/bench_cpu_test.go` + `go/gpu/bench_gpu_test.go`,
+   `julia/bench_cpu.jl` + `julia/bench_gpu.jl`)
 - Memory/GC data collection via `getrusage` (peak_rss), language-specific alloc tracking, GC callback instrumentation
-- All 22 scenarios × 5 axes producing unified JSON output
+- All 33 scenarios × 6 axes producing unified JSON output
 - BLAS unified: all languages use Apple Accelerate (`cblas_sgemm`) for matmul
 
 Phase 3 (DONE):
 
 - Benchmark results and methodology published in `docs/bench-results.md`
-- Raw JSON outputs in `benchmarks/{python,rust,go,julia}.json`
+- Raw JSON outputs in `benchmarks/{python,rust,go,julia}.json` and `benchmarks/{python,rust,go,julia}_gpu.json`
 
 Phase 4 (DONE): Equation-to-code mapping tables (21 entries) and math-to-code comments added to all source files across 4 languages.

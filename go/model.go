@@ -95,6 +95,63 @@ func (m *MoETransformer) TotalAuxLoss(alpha float32) float32 {
 	return total
 }
 
+// ApplyZLoss computes router z-loss across all layers and backprops gradients.
+// Must be called AFTER model.Backward() so gate.lastInput is available.
+// Accumulates z-loss gradients into gate.weight.Grad.
+func (m *MoETransformer) ApplyZLoss(zWeight float32) float32 {
+	total := float32(0)
+	for _, blk := range m.blocks {
+		total += blk.moe.router.ComputeZLossWithGrad(zWeight)
+	}
+	return total
+}
+
+// ApplyAuxLoss computes auxiliary load-balancing loss across all layers and backprops gradients.
+// Must be called AFTER model.Backward() so gate.lastInput is available.
+// Accumulates aux-loss gradients into gate.weight.Grad.
+func (m *MoETransformer) ApplyAuxLoss(alpha float32) float32 {
+	total := float32(0)
+	for _, blk := range m.blocks {
+		total += blk.moe.router.ComputeAuxLossWithGrad(alpha)
+	}
+	return total
+}
+
+// SetRoutingMode configures the routing strategy for all layers.
+func (m *MoETransformer) SetRoutingMode(mode RoutingMode, lambda float32) {
+	for _, blk := range m.blocks {
+		blk.SetRoutingMode(mode, lambda)
+	}
+}
+
+// UpdateRoutingBiases updates BiasFree expert biases across all layers.
+func (m *MoETransformer) UpdateRoutingBiases(gamma float32) {
+	for _, blk := range m.blocks {
+		blk.UpdateRoutingBiases(gamma)
+	}
+}
+
+// ApplyReLUL1Loss computes and backprops ReLU L1 regularization loss across all layers.
+func (m *MoETransformer) ApplyReLUL1Loss() float32 {
+	total := float32(0)
+	for _, blk := range m.blocks {
+		total += blk.ApplyReLUL1Loss()
+	}
+	return total
+}
+
+// AvgActiveExperts returns the average number of active experts across all layers.
+func (m *MoETransformer) AvgActiveExperts() float32 {
+	if len(m.blocks) == 0 {
+		return 0
+	}
+	total := float32(0)
+	for _, blk := range m.blocks {
+		total += blk.AvgActiveExperts()
+	}
+	return total / float32(len(m.blocks))
+}
+
 // Generate produces tokens using greedy decoding (default strategy).
 func (m *MoETransformer) Generate(prompt []int, maxLen int) []int {
 	return m.GenerateGreedy(prompt, maxLen)
